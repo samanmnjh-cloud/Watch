@@ -1,0 +1,1394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Wallet Watch</title>
+<!-- Added to the iPad home screen it opens without Safari's chrome. -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Wallet Watch" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#FFFFFF" />
+<meta name="color-scheme" content="light" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: #FFFFFF;
+    color: #0B0D12;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    /* Every figure the same width, so columns line up without a mono face. */
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum' 1, 'cv05' 1;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  input, button, textarea, select { font-family: inherit; font-variant-numeric: tabular-nums; }
+  input:focus { border-color: #2E5CFF !important; }
+  input[type=number]::-webkit-outer-spin-button,
+  input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; }
+  button:hover:not(:disabled) { filter: brightness(0.97); }
+  table tbody tr:hover { background: #F6F7F9; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: #FFFFFF; }
+  ::-webkit-scrollbar-thumb { background: #D7DBE1; border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: #BFC5CE; }
+  .boot {
+    max-width: 520px; margin: 18vh auto; padding: 22px 24px;
+    border: 1px solid #E4E7EC; border-radius: 10px; background: #FFFFFF;
+    font-size: 13.5px; line-height: 1.6; color: #3F4552;
+  }
+  .boot h1 { font-size: 15px; color: #C62828; margin: 0 0 10px; }
+  .boot code { font-size: 12px; color: #6B7280; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/plain" id="app-source">
+/* --------------------------------------------------------- persistence */
+/* Wraps window.storage. Tolerates get/set OR getItem/setItem, sync or
+   promise-returning. Falls back to an in-memory map so the app still runs
+   (for the current session only) if no host storage is present.          */
+const Store = (() => {
+  const mem = new Map();
+  const host = (typeof window !== 'undefined' && window.storage) ? window.storage : null;
+
+  /* Host storage APIs differ between environments — method names, whether
+     they take structured values or strings, and whether reading an unset key
+     returns null or throws. Rather than assume, probe once at boot and adopt
+     whichever shape actually round-trips. */
+  const PAIRS = [['getItem', 'setItem'], ['get', 'set'], ['read', 'write'], ['getValue', 'setValue']];
+  const PROBE_KEY = '__tj_probe__';
+
+  let impl = null;          // { g, st, structured, unwrap }
+  const log = [];           // human-readable trace, surfaced in the UI
+
+  const unwrapValue = (v) => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      for (const k of ['value', 'data', 'result']) {
+        if (k in v) return v[k];
+      }
+    }
+    return v;
+  };
+
+  /* A write that throws has NOT necessarily failed — some host bridges
+     complete the write and then reject while parsing their own response.
+     So always read back before writing a shape off. */
+  async function tryRoundTrip(g, st, payload, matches) {
+    let wroteThrew = null;
+    try {
+      await host[st](PROBE_KEY, payload);
+    } catch (e) {
+      wroteThrew = (e && e.message) || String(e);
+    }
+    let back;
+    try {
+      back = unwrapValue(await host[g](PROBE_KEY));
+    } catch (e) {
+      log.push(g + '/' + st + ' [' + (typeof payload) + ']: write ' +
+        (wroteThrew ? 'threw (' + wroteThrew + ')' : 'ok') + ', read threw (' + ((e && e.message) || e) + ')');
+      return false;
+    }
+    if (matches(back)) {
+      if (wroteThrew) log.push(g + '/' + st + ' [' + (typeof payload) + ']: write reported "' + wroteThrew + '" but the value read back correctly — treating as usable');
+      return true;
+    }
+    log.push(g + '/' + st + ' [' + (typeof payload) + ']: write ' +
+      (wroteThrew ? 'threw (' + wroteThrew + ')' : 'ok') + ', read back ' + JSON.stringify(back));
+    return false;
+  }
+
+  async function probe() {
+    if (!host) { log.push('window.storage is not present'); return; }
+    log.push('window.storage members: ' + Object.keys(host).concat(
+      Object.getPrototypeOf(host) && Object.getPrototypeOf(host) !== Object.prototype
+        ? Object.getOwnPropertyNames(Object.getPrototypeOf(host)).filter((k) => k !== 'constructor')
+        : []
+    ).join(', '));
+
+    for (const [g, st] of PAIRS) {
+      if (typeof host[g] !== 'function' || typeof host[st] !== 'function') continue;
+
+      // A host that keeps structured values is preferable — no double encoding.
+      try {
+        if (await tryRoundTrip(g, st, { __tj: 'ok' }, (b) => b && b.__tj === 'ok')) {
+          impl = { g, st, structured: true };
+          log.push('using ' + g + '/' + st + ' with structured values');
+          return;
+        }
+      } catch (e) { log.push(g + '/' + st + ' (object) threw: ' + (e && e.message)); }
+
+      try {
+        if (await tryRoundTrip(g, st, 'tj-ok', (b) => b === 'tj-ok')) {
+          impl = { g, st, structured: false };
+          log.push('using ' + g + '/' + st + ' with JSON strings');
+          return;
+        }
+      } catch (e) { log.push(g + '/' + st + ' (string) threw: ' + (e && e.message)); }
+    }
+    log.push('no usable window.storage shape found');
+  }
+
+  /* Tier 2. When the host API is unusable — or absent because the file was
+     downloaded and opened directly — plain localStorage still persists. */
+  function probeLocalStorage() {
+    try {
+      const t = '__tj_ls_probe__';
+      window.localStorage.setItem(t, 'ok');
+      const ok = window.localStorage.getItem(t) === 'ok';
+      window.localStorage.removeItem(t);
+      if (ok) {
+        impl = { local: true };
+        log.push('falling back to window.localStorage — persistence is per-browser, not per-account');
+        return true;
+      }
+      log.push('localStorage did not round-trip');
+    } catch (e) {
+      log.push('localStorage unavailable: ' + ((e && e.message) || e));
+    }
+    return false;
+  }
+
+  const ready = probe()
+    .catch((e) => { log.push('probe failed: ' + ((e && e.message) || e)); })
+    .then(() => {
+      if (!impl && !probeLocalStorage()) {
+        log.push('no persistent storage available — entries will not survive a reload');
+      }
+    });
+
+  return {
+    ready,
+    get diagnostics() { return log.slice(); },
+    note(msg) { log.push(msg); },
+    get ephemeral() { return !impl; },
+    get mode() {
+      if (!impl) return 'in-memory only';
+      if (impl.local) return 'window.localStorage';
+      return 'window.storage.' + impl.g + '/' + impl.st + (impl.structured ? ' (structured)' : ' (string)');
+    },
+
+    async get(k, fallback) {
+      await ready;
+      if (!impl) return mem.has(k) ? mem.get(k) : fallback;
+      let raw;
+      try {
+        raw = impl.local ? window.localStorage.getItem(k) : unwrapValue(await host[impl.g](k));
+      } catch (e) {
+        /* Several hosts throw rather than return null for an unset key —
+           that is a miss, not a failure. */
+        return fallback;
+      }
+      if (raw === null || raw === undefined || raw === '') return fallback;
+      /* Parse strings in either mode: a structured host may still be holding
+         JSON written by an earlier build, or may serialise on its own. */
+      if (typeof raw === 'string') {
+        try { return JSON.parse(raw); } catch (e) { return raw; }
+      }
+      return raw;
+    },
+
+    async set(k, v) {
+      await ready;
+      if (!impl) { mem.set(k, v); return true; }
+      try {
+        if (impl.local) window.localStorage.setItem(k, JSON.stringify(v));
+        else await host[impl.st](k, impl.structured ? v : JSON.stringify(v));
+        return true;
+      } catch (e) {
+        log.push('write to "' + k + '" failed: ' + (e && e.message));
+        mem.set(k, v);
+        return false;
+      }
+    },
+  };
+})();
+
+/* =====================================================================
+   WALLET WATCH — what the wallets you follow are doing, market by market.
+   Reads public Polymarket data: a wallet's positions, and its trades.
+   Nothing here needs a key, because none of it is private.
+   ===================================================================== */
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+const C = {
+  bg: '#FFFFFF', card: '#FFFFFF', cardAlt: '#F6F7F9', border: '#E4E7EC',
+  blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
+  orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
+};
+const APP_VERSION = 'v1';
+const APP_BUILT = '8 Nov 2026';
+const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+
+/* Green, red and orange already mean added, reduced and trimmed, so a wallet
+   never wears one — otherwise a colour would say two things at once. */
+const WCOLOURS = ['#4338CA', '#7C4DFF', '#0E7490', '#0891B2', '#6D28D9', '#BE185D', '#1D4ED8'];
+const MINE_COLOUR = '#334155';
+
+const K_WALLETS = 'ww_wallets';
+const K_BOOKS = 'ww_books';
+const K_EVENTS = 'ww_events';
+const K_WATCH = 'ww_watch';
+const K_PREFS = 'ww_prefs';
+
+/* ------------------------------------------------------------- helpers */
+const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
+const money = (v) => {
+  const a = Math.abs(num(v));
+  if (a >= 1e6) return (v < 0 ? '-' : '') + '$' + (a / 1e6).toFixed(a >= 1e7 ? 0 : 1) + 'M';
+  if (a >= 1000) return (v < 0 ? '-' : '') + '$' + Math.round(a / 1000) + 'k';
+  if (a >= 1) return (v < 0 ? '-' : '') + '$' + Math.round(a);
+  return (v < 0 ? '-' : '') + '$' + a.toFixed(2);
+};
+const signed = (kind, v) => (kind === 'ADDED' || kind === 'NEW' ? '+' : '−') + money(v);
+const shortAddr = (a) => (a && a.length > 12 ? a.slice(0, 6) + '…' + a.slice(-4) : a || '');
+const ago = (t, now) => {
+  const s = Math.max(0, (now || Date.now()) / 1000 - t), h = s / 3600;
+  if (h < 1) return Math.max(1, Math.round(s / 60)) + 'm ago';
+  if (h < 36) return Math.round(h) + 'h ago';
+  return Math.round(h / 24) + 'd ago';
+};
+const WINDOWS = [{ h: 24, l: '24h' }, { h: 48, l: '2d' }, { h: 168, l: '7d' }, { h: 720, l: '30d' }];
+
+/* A wallet has no picture on Polymarket, so it gets a mark of its own that is
+   the same every time: four squares drawn from the address. */
+function Identicon({ addr, colour, size = 26 }) {
+  const cells = useMemo(() => {
+    const h = String(addr || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+    const out = [];
+    for (let i = 0; i < 9; i++) out.push(parseInt(h.charAt(i + 2) || '0', 16) > 7);
+    return out;
+  }, [addr]);
+  const u = size / 3;
+  return (
+    <span style={{ width: size, height: size, borderRadius: 7, flexShrink: 0, display: 'block',
+      background: (colour || C.gray) + '1A', border: '1px solid ' + (colour || C.gray) + '33',
+      position: 'relative', overflow: 'hidden' }}>
+      {cells.map((on, i) => (on ? (
+        <span key={i} style={{ position: 'absolute', background: colour || C.gray,
+          left: (i % 3) * u, top: Math.floor(i / 3) * u, width: u, height: u, opacity: 0.85 }} />
+      ) : null))}
+    </span>
+  );
+}
+
+function MarketIcon({ src, size = 26 }) {
+  const [bad, setBad] = useState(false);
+  const box = { width: size, height: size, borderRadius: 7, flexShrink: 0, objectFit: 'cover',
+    border: '1px solid ' + C.border, background: C.cardAlt };
+  if (!src || bad) return <span style={box} />;
+  return <img src={src} alt="" width={size} height={size} onError={() => setBad(true)} style={box} />;
+}
+
+/* ------------------------------------------------------------- the API */
+const POS_URL = (w) => 'https://data-api.polymarket.com/positions?user=' +
+  encodeURIComponent(w) + '&limit=500';
+const ACT_URL = (w, off) => 'https://data-api.polymarket.com/activity?user=' +
+  encodeURIComponent(w) + '&type=TRADE&limit=500&offset=' + off +
+  '&sortBy=TIMESTAMP&sortDirection=DESC';
+
+const OFFLINE = (typeof location !== 'undefined' && /^(file|blob):/.test(location.protocol));
+
+/* A failure here has three flavours and only one of them is your fault, so
+   the message has to say which: the browser never let the request out, the
+   request went out and came back refused, or it came back as something that
+   is not a list of positions. */
+function readError(err) {
+  const m = (err && err.message) || String(err || 'failed');
+  if (err && (err.name === 'TypeError' || /load failed|failed to fetch|networkerror/i.test(m))) {
+    return OFFLINE
+      ? 'the page is open as a file, so the browser blocks Polymarket — open it from your web address instead'
+      : 'the browser blocked the request before it reached Polymarket (' + m + ')';
+  }
+  return m;
+}
+
+async function getJSON(url) {
+  let res;
+  try { res = await fetch(url); }
+  catch (e) { const x = new Error(readError(e)); x.plain = true; throw x; }
+  if (!res.ok) {
+    const x = new Error(res.status === 400
+      ? 'Polymarket says that address is not valid (400)'
+      : res.status === 429 ? 'Polymarket is rate-limiting (429) — wait a minute and sync again'
+      : 'Polymarket returned ' + res.status + ' ' + (res.statusText || ''));
+    x.plain = true; throw x;
+  }
+  let j;
+  try { j = await res.json(); }
+  catch (e) { const x = new Error('Polymarket sent something that is not data'); x.plain = true; throw x; }
+  if (Array.isArray(j)) return j;
+  /* Some responses wrap the list; take it rather than giving up on it. */
+  for (const k of ['data', 'positions', 'results', 'activity']) {
+    if (Array.isArray(j && j[k])) return j[k];
+  }
+  const x = new Error('Polymarket sent no list of positions back');
+  x.plain = true; throw x;
+}
+
+/* Trades, newest first, as far back as the widest window anyone can pick. */
+async function fetchTrades(wallet, sinceSec) {
+  const out = [];
+  for (let page = 0; page < 8; page++) {
+    const batch = await getJSON(ACT_URL(wallet, page * 500));
+    out.push(...batch);
+    if (batch.length < 500) break;
+    const last = batch[batch.length - 1];
+    if (last && num(last.timestamp) < sinceSec) break;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------- shaping it up */
+const mkey = (r) => String((r && (r.conditionId || r.asset)) || '').toLowerCase();
+
+function bookFrom(raw) {
+  const pos = (raw || [])
+    .filter((p) => num(p.currentValue) > 0.01 && !p.redeemable)
+    .map((p) => ({
+      key: mkey(p), asset: p.asset, title: p.title || p.slug || 'Untitled market',
+      icon: p.icon || p.imageOptimized || null, slug: p.slug || '', eventSlug: p.eventSlug || '',
+      outcome: String(p.outcome || '').toUpperCase(), shares: num(p.size),
+      price: num(p.curPrice), value: num(p.currentValue), endDate: p.endDate || null,
+    }));
+  const tot = pos.reduce((a, p) => a + p.value, 0);
+  pos.forEach((p) => { p.pct = tot > 0 ? p.value / tot * 100 : 0; });
+  pos.sort((a, b) => b.value - a.value);
+  /* Markets that have settled, kept apart: the watchlist wants to know. */
+  const done = (raw || []).filter((p) => p.redeemable ||
+      (num(p.curPrice, -1) >= 0 && (num(p.curPrice) <= 0.0005 || num(p.curPrice) >= 0.9995)))
+    .map((p) => mkey(p));
+  return { at: Date.now(), tot, pos, resolved: done };
+}
+
+/* A trade only becomes Added, Reduced, New or Exited once you know what the
+   wallet held before it. Walk the trades back from today's holding and the
+   answer falls out; a buy onto nothing is a new position, a sell down to
+   nothing is an exit. */
+function classify(trades, heldByAsset) {
+  const byAsset = {};
+  (trades || []).forEach((t) => {
+    const side = String(t.side || '').toUpperCase();
+    if (side !== 'BUY' && side !== 'SELL') return;
+    const a = t.asset || t.conditionId;
+    if (!a) return;
+    (byAsset[a] || (byAsset[a] = [])).push({
+      at: num(t.timestamp), side, shares: num(t.size),
+      price: num(t.price) > 1 ? num(t.price) / 100 : num(t.price),
+      title: t.title || t.slug || 'Untitled market', icon: t.icon || null,
+      slug: t.slug || '', eventSlug: t.eventSlug || '',
+      outcome: String(t.outcome || '').toUpperCase(), key: mkey(t), asset: a,
+      hash: t.transactionHash || null,
+    });
+  });
+  const out = [];
+  Object.keys(byAsset).forEach((a) => {
+    const list = byAsset[a].sort((x, y) => y.at - x.at);
+    /* The same fill can arrive twice across a page boundary. */
+    for (let i = list.length - 1; i > 0; i--) {
+      const p = list[i], q = list[i - 1];
+      if (p.hash && p.hash === q.hash && p.side === q.side &&
+          Math.abs(p.shares - q.shares) < 1e-9) list.splice(i, 1);
+    }
+    let after = num(heldByAsset[a]);        // shares held now
+    list.forEach((t) => {
+      const before = after - (t.side === 'BUY' ? t.shares : -t.shares);
+      const kind = t.side === 'BUY'
+        ? (before <= 0.000001 ? 'NEW' : 'ADDED')
+        : (after <= 0.000001 ? 'EXITED' : 'REDUCED');
+      out.push(Object.assign({}, t, { kind, value: t.shares * t.price }));
+      after = before;
+    });
+  });
+  return out.sort((a, b) => b.at - a.at);
+}
+
+/* Everything one wallet did to one market inside the window, said once. */
+function digest(events) {
+  if (!events || !events.length) return null;
+  const es = events.slice().sort((a, b) => a.at - b.at);
+  let inn = 0, out = 0, opened = false;
+  es.forEach((e) => {
+    if (e.kind === 'ADDED' || e.kind === 'NEW') { inn += e.value; if (e.kind === 'NEW') opened = true; }
+    else out += e.value;
+  });
+  const exited = es[es.length - 1].kind === 'EXITED';
+  const net = inn - out;
+  let kind, text;
+  if (exited) { kind = 'EXITED'; text = 'Exited — ' + money(out) + ' out'; }
+  else if (out === 0) { kind = opened ? 'NEW' : 'ADDED'; text = (opened ? 'Opened ' : 'Added ') + money(inn); }
+  else if (inn === 0) { kind = 'REDUCED'; text = 'Reduced ' + money(out); }
+  else {
+    kind = net >= 0 ? 'ADDED' : 'REDUCED';
+    text = 'Net ' + (net >= 0 ? '+' : '−') + money(Math.abs(net)) +
+      '  (' + money(inn) + ' in, ' + money(out) + ' out)';
+  }
+  return { kind, text, n: es.length, last: es[es.length - 1].at, net, inn, out };
+}
+
+/* -------------------------------------------------------- primitives */
+function Btn({ children, onClick, kind = 'default', disabled, style, title, ...rest }) {
+  const k = { default: { bg: C.card, fg: C.ink2, bd: C.border },
+    primary: { bg: C.blue, fg: '#fff', bd: C.blue },
+    ghost: { bg: 'transparent', fg: C.ink3, bd: 'transparent' } }[kind] ||
+    { bg: C.card, fg: C.ink2, bd: C.border };
+  return (
+    <button {...rest} type="button" onClick={onClick} disabled={disabled} title={title}
+      style={Object.assign({ background: k.bg, color: k.fg, border: '1px solid ' + k.bd,
+        borderRadius: 7, padding: '7px 13px', font: 'inherit', fontSize: 12.5, fontWeight: 600,
+        cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.45 : 1 }, style)}>
+      {children}
+    </button>
+  );
+}
+function Chip({ on, children, onClick, title }) {
+  return (
+    <button type="button" onClick={onClick} title={title} style={{
+      border: '1px solid ' + (on ? '#C3CFFF' : C.border), background: on ? '#EEF2FF' : C.card,
+      color: on ? C.blue : C.ink3, fontWeight: on ? 700 : 500, borderRadius: 999,
+      padding: '5px 12px', font: 'inherit', fontSize: 12.5, cursor: 'pointer',
+    }}>{children}</button>
+  );
+}
+function IconBtn({ children, onClick, title, tone }) {
+  return (
+    <button type="button" onClick={onClick} title={title} style={{
+      border: '1px solid transparent', background: 'none', borderRadius: 7, width: 26, height: 26,
+      cursor: 'pointer', color: tone || C.ink3, display: 'grid', placeItems: 'center',
+      padding: 0, fontSize: 15, lineHeight: 1, flexShrink: 0,
+    }}
+      onMouseEnter={(e) => { e.currentTarget.style.borderColor = C.border;
+        e.currentTarget.style.background = C.cardAlt; }}
+      onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'transparent';
+        e.currentTarget.style.background = 'none'; }}>{children}</button>
+  );
+}
+const BDG = {
+  ADDED: { c: C.green }, NEW: { c: C.blue }, REDUCED: { c: C.orange }, EXITED: { c: C.ink3 },
+  YES: { c: C.green }, NO: { c: C.red },
+};
+function Badge({ kind, width }) {
+  const t = BDG[kind] || BDG.EXITED;
+  return (
+    <span style={{ display: 'inline-block', width: width || '100%', textAlign: 'center',
+      fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, borderRadius: 4, padding: '3px 0',
+      lineHeight: 1.25, color: t.c, background: t.c + '14', border: '1px solid ' + t.c + '30',
+    }}>{kind}</span>
+  );
+}
+function Dot({ colour, size = 10 }) {
+  return <span style={{ width: size, height: size, borderRadius: 3, background: colour,
+    flexShrink: 0, display: 'inline-block' }} />;
+}
+function Card({ children, style }) {
+  return <div style={Object.assign({ background: C.card, border: '1px solid ' + C.border,
+    borderRadius: 12, overflow: 'hidden', marginBottom: 14 }, style)}>{children}</div>;
+}
+function CardHead({ children }) {
+  return <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 15px',
+    borderBottom: '1px solid ' + C.border, background: C.cardAlt, flexWrap: 'wrap' }}>{children}</div>;
+}
+const Tiny = ({ children, style }) => (
+  <span style={Object.assign({ fontSize: 11, color: C.ink3 }, style)}>{children}</span>
+);
+
+/* share of that wallet's own book, read the same way everywhere */
+function BookShare({ pct, colour, biggest }) {
+  if (pct === null || pct === undefined) return <span />;
+  return (
+    <span style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'flex-end' }}>
+      <span style={{ width: 28, height: 4, borderRadius: 2, background: C.cardAlt,
+        position: 'relative', flexShrink: 0 }}>
+        <span style={{ position: 'absolute', left: 0, top: 0, bottom: 0, borderRadius: 2,
+          width: Math.max(6, Math.min(100, pct / Math.max(biggest || 1, 1) * 100)) + '%',
+          background: colour }} />
+      </span>
+      <Tiny style={{ minWidth: 36, textAlign: 'right' }}>{pct.toFixed(1)}%</Tiny>
+    </span>
+  );
+}
+
+function Modal({ title, children, onClose, width = 460 }) {
+  useEffect(() => {
+    const h = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [onClose]);
+  return (
+    <div onClick={(e) => { if (e.target === e.currentTarget) onClose(); }} style={{
+      position: 'fixed', inset: 0, background: 'rgba(11,13,18,0.32)', zIndex: 100, display: 'flex',
+      alignItems: 'flex-start', justifyContent: 'center', padding: '8vh 16px 40px', overflowY: 'auto',
+    }}>
+      <div style={{ background: C.card, border: '1px solid ' + C.border, borderRadius: 12,
+        width: '100%', maxWidth: width, boxShadow: '0 18px 50px rgba(11,13,18,0.18)' }}>
+        <div style={{ padding: '16px 18px 13px', borderBottom: '1px solid ' + C.border,
+          display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 14.5, fontWeight: 700, flex: 1 }}>{title}</span>
+          <IconBtn onClick={onClose} title="Close">×</IconBtn>
+        </div>
+        <div style={{ padding: 18 }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ----------------------------------------------------- the wallet strip */
+const EYE = (
+  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.9">
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z" /><circle cx="12" cy="12" r="3" />
+  </svg>
+);
+const EYE_OFF = (
+  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.9">
+    <path d="M17.9 17.9A10.1 10.1 0 0 1 12 20C5 20 1 12 1 12a18 18 0 0 1 5.1-5.9m3.6-1.8A10.1 10.1 0 0 1 12 4c7 0 11 8 11 8a18 18 0 0 1-2.2 3.2M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+    <path d="m1 1 22 22" />
+  </svg>
+);
+const PLUS = (
+  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+    strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+);
+
+function WalletStrip({ wallets, books, counts, sel, hidden, onPick, onHide, onRemove, onAdd }) {
+  return (
+    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
+      {wallets.map((w) => {
+        const b = books[w.id];
+        const isSel = sel === w.id, isHid = !!hidden[w.id];
+        return (
+          <div key={w.id} data-wallet={w.id}
+            onClick={(e) => { if (e.target.closest('[data-stop]') || isHid) return; onPick(w.id); }}
+            style={{ flex: '1 1 232px', minWidth: 216, background: C.card, borderRadius: 10,
+              border: '1px solid ' + (isSel ? C.blue : C.border),
+              boxShadow: isSel ? '0 0 0 2px ' + C.blue + '22' : 'none',
+              opacity: isHid ? 0.42 : 1, padding: '11px 13px', cursor: isHid ? 'default' : 'pointer' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+              <Identicon addr={w.addr} colour={w.colour} size={26} />
+              <span style={{ fontSize: 13, fontWeight: 700, minWidth: 0, overflow: 'hidden',
+                textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{w.label}</span>
+              {w.mine && <span style={{ fontSize: 9.5, letterSpacing: 0.5, textTransform: 'uppercase',
+                fontWeight: 700, color: C.ink2, background: C.cardAlt, border: '1px solid ' + C.border,
+                borderRadius: 4, padding: '0 5px', lineHeight: '15px', flexShrink: 0 }}>you</span>}
+              <span style={{ flex: 1 }} />
+              <span data-stop style={{ display: 'flex', gap: 1 }}>
+                <IconBtn title={isHid ? 'Show this wallet' : 'Hide this wallet'}
+                  onClick={() => onHide(w.id)}>{isHid ? EYE_OFF : EYE}</IconBtn>
+                <IconBtn title="Remove this wallet" onClick={() => onRemove(w)}>×</IconBtn>
+              </span>
+            </div>
+            <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.ink3, marginTop: 4 }}>
+              {shortAddr(w.addr)}
+            </div>
+            <div style={{ display: 'flex', gap: 14, marginTop: 8, fontSize: 11.5, color: C.ink3 }}>
+              <span><b style={{ color: C.ink, fontSize: 15, display: 'block', lineHeight: 1.2 }}>
+                {b ? money(b.tot) : '—'}</b>portfolio</span>
+              <span><b style={{ color: C.ink, fontSize: 15, display: 'block', lineHeight: 1.2 }}>
+                {b ? b.pos.length : '—'}</b>markets</span>
+              <span><b style={{ color: counts[w.id] ? w.colour : C.gray, fontSize: 15,
+                display: 'block', lineHeight: 1.2 }}>{counts[w.id] || 0}</b>moves</span>
+            </div>
+          </div>
+        );
+      })}
+      <button type="button" onClick={onAdd} style={{ flex: '0 0 136px', display: 'flex', gap: 7,
+        alignItems: 'center', justifyContent: 'center', border: '1px dashed ' + C.border,
+        borderRadius: 10, color: C.ink3, font: 'inherit', fontSize: 12.5, cursor: 'pointer',
+        background: C.card }}>{PLUS} Add wallet</button>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------- the feed */
+function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, now }) {
+  const byId = useMemo(() => {
+    const m = {}; wallets.forEach((w) => { m[w.id] = w; }); return m;
+  }, [wallets]);
+  if (!events.length) {
+    return (
+      <Card><CardHead><span style={{ fontSize: 13, fontWeight: 700 }}>Activity</span></CardHead>
+        <div style={{ padding: 26, textAlign: 'center', color: C.ink3, fontSize: 13 }}>
+          Nothing in this window.
+        </div></Card>
+    );
+  }
+  let inn = 0, out = 0, news = 0;
+  events.forEach((e) => {
+    if (e.kind === 'ADDED' || e.kind === 'NEW') { inn += e.value; if (e.kind === 'NEW') news++; }
+    else out += e.value;
+  });
+  const days = [];
+  events.forEach((e) => {
+    const d = new Date(e.at * 1000).toDateString();
+    if (!days.length || days[days.length - 1].d !== d) days.push({ d, at: e.at, rows: [] });
+    days[days.length - 1].rows.push(e);
+  });
+  /* who did it, then what it was done to: the wallet's own mark sits beside
+     the market's picture so a row never has to be read to be placed. */
+  const ROW = { display: 'grid',
+    gridTemplateColumns: '56px 20px 24px 84px 46px minmax(0,1fr) 116px 76px 88px',
+    gap: 9, alignItems: 'center', padding: '7px 15px', borderTop: '1px solid #F2F4F7',
+    fontSize: 12.5 };
+  return (
+    <Card>
+      <CardHead>
+        <span style={{ fontSize: 13, fontWeight: 700 }}>Activity</span>
+        {sel && byId[sel] ? (
+          <React.Fragment>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, fontSize: 12.5,
+              fontWeight: 600, background: C.card, border: '1px solid ' + C.border,
+              borderRadius: 999, padding: '3px 6px 3px 10px' }}>
+              <Dot colour={byId[sel].colour} />{byId[sel].label}
+              <IconBtn onClick={onClearSel} title="Show every wallet">×</IconBtn>
+            </span>
+            <Chip onClick={onClearSel}>Show all</Chip>
+          </React.Fragment>
+        ) : <Tiny>every wallet · tap a card to see just one</Tiny>}
+        <span style={{ marginLeft: 'auto', fontSize: 12, color: C.ink3 }}>
+          {events.length} move{events.length === 1 ? '' : 's'} · {news} new ·{' '}
+          <span style={{ color: C.green }}>+{money(inn)}</span> in ·{' '}
+          <span style={{ color: C.orange }}>−{money(out)}</span> out
+        </span>
+      </CardHead>
+      {days.map((day) => (
+        <div key={day.d}>
+          <div style={{ fontSize: 11, letterSpacing: 0.6, textTransform: 'uppercase',
+            color: C.ink3, fontWeight: 700, padding: '13px 15px 6px' }}>
+            {new Date(day.at * 1000).toLocaleDateString('en-GB',
+              { weekday: 'long', day: 'numeric', month: 'short' })}
+          </div>
+          {day.rows.map((e, i) => {
+            const w = byId[e.w] || {};
+            const b = books[e.w];
+            const held = b && b.pos.filter((p) => p.key === e.key)[0];
+            const big = b && b.pos.length ? b.pos[0].pct : 1;
+            const up = e.kind === 'ADDED' || e.kind === 'NEW';
+            return (
+              <div key={e.at + '-' + e.asset + '-' + i} style={ROW}>
+                <Tiny>{ago(e.at, now)}</Tiny>
+                <Identicon addr={w.addr} colour={w.colour} size={20} />
+                <MarketIcon src={e.icon} size={24} />
+                <Badge kind={e.kind} />
+                <Badge kind={e.outcome === 'YES' ? 'YES' : 'NO'} width={46} />
+                <span data-market={e.key} onClick={() => onOpenMarket(e.key)} title={e.title}
+                  style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                    color: C.ink2, cursor: 'pointer' }}
+                  onMouseEnter={(ev) => { ev.currentTarget.style.color = C.blue;
+                    ev.currentTarget.style.textDecoration = 'underline'; }}
+                  onMouseLeave={(ev) => { ev.currentTarget.style.color = C.ink2;
+                    ev.currentTarget.style.textDecoration = 'none'; }}>{e.title}</span>
+                <Tiny style={{ textAlign: 'right' }}>
+                  {Math.round(e.shares).toLocaleString()} sh @ {Math.round(e.price * 100)}¢
+                </Tiny>
+                <span style={{ textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap',
+                  color: up ? C.green : C.orange }}>{signed(e.kind, e.value)}</span>
+                <BookShare pct={held ? held.pct : null} colour={w.colour} biggest={big} />
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </Card>
+  );
+}
+
+/* ------------------------------------------------------ one market */
+function MarketRow({ m, wallets, books, events, watched, onToggleWatch, onOpen, open, now,
+  sub, onSub, pinned }) {
+  const byId = {}; wallets.forEach((w) => { byId[w.id] = w; });
+  const holders = m.holders;
+  const tot = holders.reduce((a, h) => a + h.value, 0);
+  const outs = {}; holders.forEach((h) => { outs[h.outcome] = 1; });
+  const split = Object.keys(outs).length > 1;
+  const mine = events.filter((e) => e.key === m.key);
+  const biggest = Math.max.apply(null, holders.map((h) => h.pct).concat([0.0001]));
+  const ROW = { display: 'grid',
+    gridTemplateColumns: '26px minmax(0,1fr) 54px 190px 86px 68px 26px',
+    gap: 11, alignItems: 'center', padding: '10px 15px', borderTop: '1px solid #F2F4F7' };
+
+  const bars = holders.map((h) => {
+    const w = byId[h.w] || {};
+    const yes = h.outcome === 'YES';
+    const len = Math.max(4, h.pct / biggest * 48);
+    return (
+      <div key={h.w} title={(w.label || '') + ' — ' + h.outcome + ', ' + h.pct.toFixed(1) +
+        '% of their book'}
+        style={{ position: 'relative', height: 8, background: C.cardAlt, borderRadius: 2 }}>
+        <span style={Object.assign({ position: 'absolute', top: 0, bottom: 0, borderRadius: 2,
+          width: len + '%', background: w.colour }, yes ? { left: '50%' } : { right: '50%' })} />
+      </div>
+    );
+  });
+
+  const head = (
+    <div style={Object.assign({}, ROW, { cursor: pinned ? 'default' : 'pointer',
+      background: pinned ? '#FCFCFD' : undefined })}
+      data-mrow={m.key}
+      onClick={(e) => { if (e.target.closest('[data-stop]') || pinned) return; onOpen(m.key); }}>
+      <MarketIcon src={m.icon} size={26} />
+      <span style={{ fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden',
+        textOverflow: 'ellipsis' }} title={m.title}>{m.title}</span>
+      {split ? <span style={{ fontSize: 10, fontWeight: 700, color: C.orange,
+        background: C.orange + '12', border: '1px solid ' + C.orange + '30', borderRadius: 4,
+        padding: '2px 0', textAlign: 'center' }}>split</span> : <span />}
+      <span style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 3 }}>
+        {bars}
+        <span style={{ position: 'absolute', left: '50%', top: -2, bottom: -2, width: 1,
+          background: '#B9BFC9' }} />
+      </span>
+      <span style={{ textAlign: 'right', fontWeight: 600 }}>{money(tot)}</span>
+      <Tiny style={{ textAlign: 'right' }}>
+        {mine.length ? mine.length + ' move' + (mine.length === 1 ? '' : 's') : '—'}
+      </Tiny>
+      <span data-stop>
+        <IconBtn title={watched ? 'Remove from watchlist' : 'Add to watchlist'}
+          tone={watched ? C.ink3 : C.blue} onClick={() => onToggleWatch(m.key)}>
+          {watched ? '×' : PLUS}
+        </IconBtn>
+      </span>
+    </div>
+  );
+  if (!open) return <div>{head}</div>;
+
+  const DROW = { display: 'grid', gridTemplateColumns: '132px 46px 78px 92px minmax(0,1fr)',
+    gap: 12, alignItems: 'center', padding: '5px 0', fontSize: 12.5 };
+  const tab = sub || 'summary';
+  const body = tab === 'summary'
+    ? holders.map((h) => {
+      const w = byId[h.w] || {};
+      const g = digest(mine.filter((e) => e.w === h.w));
+      return (
+        <div key={h.w} style={DROW}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 600 }}>
+            <Dot colour={w.colour} />{w.label}
+          </span>
+          <Badge kind={h.outcome === 'YES' ? 'YES' : 'NO'} width={46} />
+          <span style={{ textAlign: 'right', fontWeight: 600 }}>{money(h.value)}</span>
+          <BookShare pct={h.pct} colour={w.colour} biggest={(books[h.w] &&
+            books[h.w].pos.length) ? books[h.w].pos[0].pct : 1} />
+          <span style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+            {g ? (
+              <React.Fragment>
+                <span style={{ width: 84, flexShrink: 0 }}><Badge kind={g.kind} /></span>
+                <Tiny style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {g.text} · {g.n} move{g.n === 1 ? '' : 's'} · last {ago(g.last, now)}
+                </Tiny>
+              </React.Fragment>
+            ) : <Tiny>no moves in this window</Tiny>}
+          </span>
+        </div>
+      );
+    })
+    : (mine.length ? mine.map((e, i) => {
+      const w = byId[e.w] || {};
+      const up = e.kind === 'ADDED' || e.kind === 'NEW';
+      return (
+        <div key={i} style={DROW}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 600 }}>
+            <Dot colour={w.colour} />{w.label}
+          </span>
+          <span style={{ width: 84 }}><Badge kind={e.kind} /></span>
+          <span style={{ textAlign: 'right', fontWeight: 600, color: up ? C.green : C.orange }}>
+            {signed(e.kind, e.value)}
+          </span>
+          <Tiny style={{ textAlign: 'right' }}>
+            {Math.round(e.shares).toLocaleString()} sh @ {Math.round(e.price * 100)}¢
+          </Tiny>
+          <Tiny>{ago(e.at, now)}</Tiny>
+        </div>
+      );
+    }) : <Tiny style={{ display: 'block', padding: '6px 0' }}>No moves in this window.</Tiny>);
+
+  return (
+    <div>
+      {head}
+      <div style={{ background: '#FCFCFD', borderTop: '1px solid ' + C.border,
+        padding: '11px 15px 13px' }}>
+        <div style={{ display: 'flex', gap: 6, marginBottom: 9 }}>
+          <Chip on={tab === 'summary'} onClick={() => onSub(m.key, 'summary')}>Summary</Chip>
+          <Chip on={tab === 'moves'} onClick={() => onSub(m.key, 'moves')}>Every move</Chip>
+        </div>
+        {body}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------- markets / watchlist */
+function MarketsView({ markets, index, wallets, books, events, watch, focus, onToggleWatch,
+  onUnfocus, sorts, now }) {
+  const [q, setQ] = useState('');
+  const [open, setOpen] = useState({});
+  const [sub, setSub] = useState({});
+  const [msort, setMsort] = useState('value');
+  const setS = (k, v) => setSub(Object.assign({}, sub, { [k]: v }));
+
+  const common = {
+    wallets, books, events, now,
+    onToggleWatch, onOpen: (k) => setOpen(Object.assign({}, open, { [k]: !open[k] })),
+    onSub: setS,
+  };
+
+  const hits = q.trim().length > 1
+    ? markets.filter((m) => m.title.toLowerCase().indexOf(q.toLowerCase().trim()) >= 0 &&
+        watch.indexOf(m.key) < 0).slice(0, 8)
+    : [];
+
+  const rows = watch.map((k) => index[k]).filter(Boolean).map((m) => {
+    const outs = {}; m.holders.forEach((h) => { outs[h.outcome] = 1; });
+    return { m, tot: m.holders.reduce((a, h) => a + h.value, 0), nw: m.holders.length,
+      acts: events.filter((e) => e.key === m.key).length,
+      dis: Object.keys(outs).length > 1 };
+  });
+  const cmp = { value: (a, b) => b.tot - a.tot, wallets: (a, b) => b.nw - a.nw || b.tot - a.tot,
+    active: (a, b) => b.acts - a.acts || b.tot - a.tot,
+    dis: (a, b) => (b.dis ? 1 : 0) - (a.dis ? 1 : 0) || b.tot - a.tot }[msort];
+  rows.sort(cmp);
+
+  const fm = focus ? index[focus] : null;
+  return (
+    <div>
+      {fm && (
+        <Card style={{ borderColor: '#C3CFFF', boxShadow: '0 0 0 2px ' + C.blue + '14' }}>
+          <CardHead>
+            <span style={{ fontSize: 13, fontWeight: 700 }}>Market</span>
+            <Tiny>opened from the activity feed</Tiny>
+            <span style={{ marginLeft: 'auto', display: 'flex', gap: 7 }}>
+              {watch.indexOf(fm.key) < 0
+                ? <Btn kind="primary" onClick={() => onToggleWatch(fm.key)}>+ Add to watchlist</Btn>
+                : <Btn onClick={() => onToggleWatch(fm.key)}>In watchlist — remove</Btn>}
+              <Btn onClick={onUnfocus}>Close</Btn>
+            </span>
+          </CardHead>
+          <MarketRow {...common} m={fm} watched={watch.indexOf(fm.key) >= 0} pinned
+            open sub={sub[fm.key]} />
+        </Card>
+      )}
+
+      <Card>
+        <CardHead>
+          <span style={{ fontSize: 13, fontWeight: 700 }}>Watchlist</span>
+          <span style={{ display: 'flex', gap: 6, marginLeft: 8, flexWrap: 'wrap' }}>
+            {[['value', 'Exposure'], ['wallets', 'Most wallets'], ['active', 'Most active'],
+              ['dis', 'Disagreement']].map((s) => (
+              <Chip key={s[0]} on={msort === s[0]} onClick={() => setMsort(s[0])}>{s[1]}</Chip>
+            ))}
+          </span>
+          <span style={{ marginLeft: 'auto', fontSize: 12, color: C.ink3 }}>
+            {watch.length} market{watch.length === 1 ? '' : 's'}
+          </span>
+        </CardHead>
+        <div style={{ padding: '11px 15px' }}>
+          <input value={q} onChange={(e) => setQ(e.target.value)}
+            placeholder="Search any market these wallets are in, then add it…"
+            style={{ width: '100%', border: '1px solid ' + C.border, borderRadius: 8,
+              padding: '9px 12px', font: 'inherit', fontSize: 13, outline: 'none' }} />
+        </div>
+        {hits.map((m) => (
+          <div key={m.key} style={{ display: 'flex', alignItems: 'center', gap: 10,
+            padding: '8px 15px', borderTop: '1px solid #F2F4F7' }}>
+            <MarketIcon src={m.icon} size={22} />
+            <span style={{ flex: 1, minWidth: 0, fontSize: 13, whiteSpace: 'nowrap',
+              overflow: 'hidden', textOverflow: 'ellipsis' }}>{m.title}</span>
+            <Tiny>{m.holders.length} wallet{m.holders.length === 1 ? '' : 's'}</Tiny>
+            <IconBtn title="Add to watchlist" tone={C.blue}
+              onClick={() => { onToggleWatch(m.key); setQ(''); }}>{PLUS}</IconBtn>
+          </div>
+        ))}
+        {q.trim().length > 1 && !hits.length && (
+          <div style={{ padding: '8px 15px', borderTop: '1px solid #F2F4F7' }}>
+            <Tiny>Nothing matches, or it is already on the list.</Tiny>
+          </div>
+        )}
+        {rows.length === 0 && (
+          <div style={{ padding: 24, textAlign: 'center', color: C.ink3, fontSize: 13 }}>
+            Your own markets are added here on their own. Search above to follow others.
+          </div>
+        )}
+        {rows.map((r) => (
+          <div key={r.m.key}>
+            <MarketRow {...common} m={r.m} watched open={!!open[r.m.key]} sub={sub[r.m.key]} />
+            {r.m.gone && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 15px 10px',
+                background: '#FFF8E6', borderTop: '1px solid #F0DFB0', fontSize: 12.5,
+                color: '#6B5420' }}>
+                <span style={{ flex: 1 }}>
+                  {r.m.resolved
+                    ? 'This market has resolved.'
+                    : 'Nobody you follow holds this any more.'}
+                </span>
+                <Btn onClick={() => onToggleWatch(r.m.key)}>Remove from watchlist</Btn>
+              </div>
+            )}
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------- wallets */
+function WalletsView({ wallets, books, events, now }) {
+  const [sort, setSort] = useState('size');
+  return (
+    <div>
+      {wallets.map((w) => {
+        const b = books[w.id];
+        if (!b) return null;
+        const touched = {};
+        events.filter((e) => e.w === w.id).forEach((e) => {
+          if (!touched[e.key] || e.at > touched[e.key].at) touched[e.key] = e;
+        });
+        const ps = b.pos.slice().sort(sort === 'size'
+          ? (x, y) => y.value - x.value
+          : (x, y) => ((touched[y.key] ? touched[y.key].at : 0) -
+              (touched[x.key] ? touched[x.key].at : 0)) || y.value - x.value);
+        const big = b.pos.length ? b.pos[0].pct : 1;
+        const ROW = { display: 'grid',
+          gridTemplateColumns: '26px 46px minmax(0,1fr) 78px 92px 86px', gap: 11,
+          alignItems: 'center', padding: '7px 15px', borderTop: '1px solid #F2F4F7', fontSize: 12.5 };
+        return (
+          <Card key={w.id}>
+            <CardHead>
+              <Identicon addr={w.addr} colour={w.colour} size={22} />
+              <span style={{ fontSize: 13, fontWeight: 700 }}>{w.label}</span>
+              <span style={{ display: 'flex', gap: 6, marginLeft: 8 }}>
+                {[['size', 'Size'], ['recent', 'Recently moved']].map((s) => (
+                  <Chip key={s[0]} on={sort === s[0]} onClick={() => setSort(s[0])}>{s[1]}</Chip>
+                ))}
+              </span>
+              <span style={{ marginLeft: 'auto', fontSize: 12, color: C.ink3 }}>
+                {money(b.tot)} · {b.pos.length} markets
+              </span>
+            </CardHead>
+            {ps.slice(0, 14).map((p) => {
+              const t = touched[p.key];
+              return (
+                <div key={p.key + p.asset} style={ROW}>
+                  <MarketIcon src={p.icon} size={22} />
+                  <Badge kind={p.outcome === 'YES' ? 'YES' : 'NO'} width={46} />
+                  <span title={p.title} style={{ whiteSpace: 'nowrap', overflow: 'hidden',
+                    textOverflow: 'ellipsis', color: C.ink2 }}>{p.title}</span>
+                  <span style={{ textAlign: 'right', fontWeight: 600 }}>{money(p.value)}</span>
+                  <BookShare pct={p.pct} colour={w.colour} biggest={big} />
+                  <span style={{ textAlign: 'right' }}>
+                    {t ? <Badge kind={t.kind} /> : <Tiny>—</Tiny>}
+                  </span>
+                </div>
+              );
+            })}
+            {b.pos.length > 14 && (
+              <div style={{ padding: '8px 15px', borderTop: '1px solid #F2F4F7' }}>
+                <Tiny>+ {b.pos.length - 14} smaller positions</Tiny>
+              </div>
+            )}
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+/* --------------------------------------------------------- add wallet */
+function AddWallet({ onSave, onClose, taken }) {
+  const [addr, setAddr] = useState('');
+  const [label, setLabel] = useState('');
+  const [mine, setMine] = useState(false);
+  const a = addr.trim().toLowerCase();
+  const ok = /^0x[0-9a-f]{40}$/.test(a);
+  const dup = taken.indexOf(a) >= 0;
+  const inp = { width: '100%', border: '1px solid ' + C.border, borderRadius: 7,
+    padding: '9px 11px', font: 'inherit', fontSize: 13.5, outline: 'none', marginTop: 6 };
+  return (
+    <Modal title="Follow a wallet" onClose={onClose}>
+      <label style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.6,
+        textTransform: 'uppercase', color: C.ink2 }}>Wallet address</label>
+      <input value={addr} onChange={(e) => setAddr(e.target.value)} autoFocus
+        placeholder="0x…" style={Object.assign({}, inp, { fontFamily: MONO, fontSize: 12.5 })} />
+      <Tiny style={{ display: 'block', marginTop: 6 }}>
+        {dup ? 'You already follow that one.'
+          : a && !ok ? 'That is not a 42-character address.'
+          : 'Public, on-chain, and readable by anyone. Nothing you paste here can move funds.'}
+      </Tiny>
+      <div style={{ marginTop: 16 }}>
+        <label style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.6,
+          textTransform: 'uppercase', color: C.ink2 }}>Name it</label>
+        <input value={label} onChange={(e) => setLabel(e.target.value)}
+          placeholder="Forecaster" style={inp} />
+      </div>
+      <label style={{ display: 'flex', gap: 9, alignItems: 'center', marginTop: 15,
+        fontSize: 13, color: C.ink2, cursor: 'pointer' }}>
+        <input type="checkbox" checked={mine} onChange={(e) => setMine(e.target.checked)} />
+        This one is mine — watch everything it holds
+      </label>
+      <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>
+        <Btn kind="primary" disabled={!ok || dup}
+          onClick={() => onSave({ addr: a, label: label.trim() || shortAddr(a), mine })}>
+          Follow
+        </Btn>
+        <Btn onClick={onClose}>Cancel</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* ----------------------------------------------------------- the app */
+function App() {
+  const [ready, setReady] = useState(false);
+  const [wallets, setWallets] = useState([]);
+  const [books, setBooks] = useState({});
+  const [events, setEvents] = useState({});
+  const [watch, setWatch] = useState([]);
+  const [tab, setTab] = useState('activity');
+  const [win, setWin] = useState(168);
+  const [sel, setSel] = useState(null);
+  const [hidden, setHidden] = useState({});
+  const [focus, setFocus] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [status, setStatus] = useState(OFFLINE
+    ? { kind: 'error', text: 'This page is open as a file, so the browser will not let it reach ' +
+        'Polymarket. Put it on your GitHub Pages address and open it there.' }
+    : null);
+  const [now, setNow] = useState(Date.now());
+
+  const wRef = useRef([]); const bRef = useRef({}); const eRef = useRef({}); const watRef = useRef([]);
+  const putWallets = (v) => { wRef.current = v; setWallets(v); Store.set(K_WALLETS, v); };
+  const putBooks = (v) => { bRef.current = v; setBooks(v); Store.set(K_BOOKS, v); };
+  const putEvents = (v) => { eRef.current = v; setEvents(v); Store.set(K_EVENTS, v); };
+  const putWatch = (v) => { watRef.current = v; setWatch(v); Store.set(K_WATCH, v); };
+
+  useEffect(() => {
+    (async () => {
+      const w = await Store.get(K_WALLETS, []);
+      const b = await Store.get(K_BOOKS, {});
+      const e = await Store.get(K_EVENTS, {});
+      const t = await Store.get(K_WATCH, []);
+      const p = await Store.get(K_PREFS, null);
+      wRef.current = Array.isArray(w) ? w : []; setWallets(wRef.current);
+      bRef.current = (b && typeof b === 'object') ? b : {}; setBooks(bRef.current);
+      eRef.current = (e && typeof e === 'object') ? e : {}; setEvents(eRef.current);
+      watRef.current = Array.isArray(t) ? t : []; setWatch(watRef.current);
+      if (p && typeof p === 'object') {
+        if (WINDOWS.some((x) => x.h === p.win)) setWin(p.win);
+        if (p.tab) setTab(p.tab);
+        if (p.hidden && typeof p.hidden === 'object') setHidden(p.hidden);
+      }
+      setReady(true);
+    })();
+  }, []);
+  useEffect(() => { if (ready) Store.set(K_PREFS, { win, tab, hidden }); }, [ready, win, tab, hidden]);
+
+  /* ---- sync */
+  const sync = useCallback(async () => {
+    const ws = wRef.current;
+    if (!ws.length || syncing) return;
+    setSyncing(true);
+    const since = Math.floor(Date.now() / 1000) - 45 * 86400;
+    const nb = Object.assign({}, bRef.current), ne = Object.assign({}, eRef.current);
+    const failed = [];
+    for (let i = 0; i < ws.length; i++) {
+      const w = ws[i];
+      setStatus({ kind: 'info', text: 'Reading ' + w.label + ' — ' + (i + 1) + ' of ' + ws.length + '…' });
+      try {
+        const raw = await getJSON(POS_URL(w.addr));
+        nb[w.id] = bookFrom(raw);
+        const held = {};
+        (raw || []).forEach((p) => { held[p.asset] = num(p.size); });
+        const trades = await fetchTrades(w.addr, since).catch(() => []);
+        ne[w.id] = classify(trades, held).filter((t) => t.at >= since)
+          .map((t) => Object.assign({ w: w.id }, t));
+      } catch (err) {
+        failed.push({ label: w.label,
+          why: (err && err.plain) ? err.message : readError(err) });
+      }
+    }
+    putBooks(nb); putEvents(ne); setNow(Date.now());
+
+    /* Your own markets follow themselves onto the list. */
+    const mineIds = ws.filter((w) => w.mine).map((w) => w.id);
+    const add = [];
+    mineIds.forEach((id) => {
+      const bk = nb[id];
+      if (bk) bk.pos.forEach((p) => {
+        if (watRef.current.indexOf(p.key) < 0 && add.indexOf(p.key) < 0) add.push(p.key);
+      });
+    });
+    if (add.length) putWatch(watRef.current.concat(add));
+
+    setSyncing(false);
+    const reasons = failed.map((f) => f.why);
+    const same = reasons.length && reasons.every((r) => r === reasons[0]);
+    setStatus(failed.length
+      ? { kind: 'error', text: failed.length === ws.length
+            ? 'No wallet could be read — ' + reasons[0]
+            : 'Could not read ' + failed.map((f) => f.label).join(', ') +
+              (same ? ' — ' + reasons[0] : '. ' + failed.map((f) => f.label + ': ' + f.why).join('; ')) }
+      : { kind: 'ok', text: 'Synced ' + new Date().toLocaleTimeString('en-US',
+          { hour: '2-digit', minute: '2-digit' }) + ' · ' + ws.length + ' wallet' +
+          (ws.length === 1 ? '' : 's') + (add.length ? ' · ' + add.length + ' added to the watchlist' : '') });
+  }, [syncing]);
+
+  /* ---- derived */
+  const visible = useMemo(() => wallets.filter((w) => !hidden[w.id]), [wallets, hidden]);
+  const cutoff = Math.floor(now / 1000) - win * 3600;
+  const allEvents = useMemo(() => {
+    const out = [];
+    visible.forEach((w) => { (events[w.id] || []).forEach((e) => {
+      if (e.at >= cutoff) out.push(e); }); });
+    return out.sort((a, b) => b.at - a.at);
+  }, [visible, events, cutoff]);
+  const feed = useMemo(() => (sel ? allEvents.filter((e) => e.w === sel) : allEvents),
+    [allEvents, sel]);
+  const counts = useMemo(() => {
+    const m = {};
+    wallets.forEach((w) => { m[w.id] = (events[w.id] || []).filter((e) => e.at >= cutoff).length; });
+    return m;
+  }, [wallets, events, cutoff]);
+
+  /* every market anyone visible holds, or has touched in the window */
+  const index = useMemo(() => {
+    const ix = {};
+    const put = (key, title, icon) => {
+      if (!key) return null;
+      if (!ix[key]) ix[key] = { key, title, icon: icon || null, holders: [], resolved: false };
+      if (icon && !ix[key].icon) ix[key].icon = icon;
+      if (title && title.length < ix[key].title.length) ix[key].title = title;
+      return ix[key];
+    };
+    visible.forEach((w) => {
+      const b = books[w.id];
+      if (b) {
+        b.pos.forEach((p) => {
+          const m = put(p.key, p.title, p.icon);
+          if (m) m.holders.push({ w: w.id, outcome: p.outcome, value: p.value, pct: p.pct });
+        });
+        (b.resolved || []).forEach((k) => { if (ix[k]) ix[k].resolved = true; });
+      }
+      (events[w.id] || []).forEach((e) => { if (e.at >= cutoff) put(e.key, e.title, e.icon); });
+    });
+    Object.keys(ix).forEach((k) => { ix[k].gone = ix[k].resolved || ix[k].holders.length === 0; });
+    return ix;
+  }, [visible, books, events, cutoff]);
+  const markets = useMemo(() => Object.keys(index).map((k) => index[k])
+    .sort((a, b) => b.holders.reduce((s, h) => s + h.value, 0) -
+      a.holders.reduce((s, h) => s + h.value, 0)), [index]);
+
+  const toggleWatch = useCallback((k) => {
+    const i = watRef.current.indexOf(k);
+    putWatch(i < 0 ? watRef.current.concat([k]) : watRef.current.filter((x) => x !== k));
+  }, []);
+  const addWallet = useCallback((d) => {
+    const used = wRef.current.map((w) => w.colour);
+    const colour = d.mine ? MINE_COLOUR :
+      (WCOLOURS.filter((c) => used.indexOf(c) < 0)[0] || WCOLOURS[wRef.current.length % WCOLOURS.length]);
+    putWallets(wRef.current.concat([{ id: 'w' + Date.now().toString(36), addr: d.addr,
+      label: d.label, colour, mine: !!d.mine }]));
+    setAdding(false);
+    setStatus({ kind: 'info', text: 'Added ' + d.label + ' — press Sync to read it.' });
+  }, []);
+  const removeWallet = useCallback((w) => {
+    putWallets(wRef.current.filter((x) => x.id !== w.id));
+    const nb = Object.assign({}, bRef.current); delete nb[w.id]; putBooks(nb);
+    const ne = Object.assign({}, eRef.current); delete ne[w.id]; putEvents(ne);
+    if (sel === w.id) setSel(null);
+  }, [sel]);
+
+  if (!ready) return <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center',
+    color: C.ink3, fontFamily: MONO, fontSize: 13 }}>Loading…</div>;
+
+  const TABS = [['activity', 'Activity'], ['markets', 'Markets'], ['wallets', 'Wallets']];
+  return (
+    <div style={{ minHeight: '100vh' }}>
+      <div style={{ position: 'sticky', top: 0, zIndex: 50, background: 'rgba(255,255,255,0.93)',
+        backdropFilter: 'blur(10px)', borderBottom: '1px solid ' + C.border }}>
+        <div style={{ maxWidth: 1180, margin: '0 auto', padding: '11px 18px', display: 'flex',
+          alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+            <span style={{ width: 8, height: 8, background: C.blue, borderRadius: 2 }} />
+            <span style={{ fontSize: 13.5, fontWeight: 700, letterSpacing: 0.2 }}>Wallet Watch</span>
+            <span title={'Build ' + APP_VERSION + ' — ' + APP_BUILT} style={{ fontFamily: MONO,
+              fontSize: 11, color: C.blue, background: C.blue + '18',
+              border: '1px solid ' + C.blue + '3A', borderRadius: 4, padding: '1px 6px',
+              fontWeight: 700 }}>{APP_VERSION}</span>
+          </div>
+          <div style={{ display: 'flex', gap: 3, background: C.card,
+            border: '1px solid ' + C.border, borderRadius: 8, padding: 3 }}>
+            {TABS.map((t) => (
+              <button key={t[0]} onClick={() => setTab(t[0])} style={{
+                background: tab === t[0] ? C.border : 'transparent',
+                color: tab === t[0] ? C.ink : C.ink3, border: 'none', borderRadius: 6,
+                padding: '6px 13px', font: 'inherit', fontSize: 12.5, fontWeight: 600,
+                cursor: 'pointer' }}>{t[1]}</button>
+            ))}
+          </div>
+          <span style={{ flex: 1 }} />
+          <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <span style={{ fontSize: 10.5, letterSpacing: 0.7, textTransform: 'uppercase',
+              color: C.ink3, fontWeight: 700 }}>Window</span>
+            {WINDOWS.map((x) => (
+              <Chip key={x.h} on={win === x.h} onClick={() => setWin(x.h)}>{x.l}</Chip>
+            ))}
+          </span>
+          <Btn kind="primary" onClick={sync} disabled={syncing || !wallets.length}>
+            {syncing ? 'Syncing…' : 'Sync'}
+          </Btn>
+        </div>
+        {status && (
+          <div style={{ borderTop: '1px solid ' + C.border,
+            background: status.kind === 'error' ? C.red + '12' : C.cardAlt }}>
+            <div style={{ maxWidth: 1180, margin: '0 auto', padding: '8px 18px', fontSize: 12.5,
+              color: status.kind === 'error' ? C.red : C.ink3, display: 'flex', gap: 10 }}>
+              <span style={{ fontFamily: MONO, color: status.kind === 'error' ? C.red
+                : status.kind === 'ok' ? C.green : C.blue }}>
+                {status.kind === 'error' ? '!' : status.kind === 'ok' ? '✓' : '…'}
+              </span>
+              <span>{status.text}</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ maxWidth: 1180, margin: '0 auto', padding: '16px 18px 80px' }}>
+        <WalletStrip wallets={wallets} books={books} counts={counts} sel={sel} hidden={hidden}
+          onPick={(id) => { setSel(sel === id ? null : id); setTab('activity'); }}
+          onHide={(id) => { setHidden(Object.assign({}, hidden, { [id]: !hidden[id] }));
+            if (sel === id) setSel(null); }}
+          onRemove={removeWallet} onAdd={() => setAdding(true)} />
+
+        {!wallets.length ? (
+          <Card><div style={{ padding: 30, textAlign: 'center' }}>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 7 }}>Nobody followed yet</div>
+            <Tiny style={{ display: 'block', marginBottom: 16, lineHeight: 1.6 }}>
+              Add a wallet address and press Sync. Start with your own and tick “this one is mine”,
+              so everything you hold is watched from the off.
+            </Tiny>
+            <Btn kind="primary" onClick={() => setAdding(true)}>Add a wallet</Btn>
+          </div></Card>
+        ) : tab === 'activity' ? (
+          <ActivityView events={feed} wallets={wallets} books={books} sel={sel}
+            onClearSel={() => setSel(null)} now={now}
+            onOpenMarket={(k) => { setFocus(k); setTab('markets');
+              window.scrollTo({ top: 0, behavior: 'smooth' }); }} />
+        ) : tab === 'markets' ? (
+          <MarketsView markets={markets} index={index} wallets={wallets} books={books}
+            events={allEvents} watch={watch} focus={focus} now={now}
+            onToggleWatch={toggleWatch} onUnfocus={() => setFocus(null)} />
+        ) : (
+          <WalletsView wallets={visible} books={books} events={allEvents} now={now} />
+        )}
+      </div>
+
+      {adding && <AddWallet onSave={addWallet} onClose={() => setAdding(false)}
+        taken={wallets.map((w) => w.addr)} />}
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+</script>
+
+<script>
+/* Dependency loader. Each entry lists fallback URLs; the first one that
+   defines its global wins. Keeps the app from silently rendering blank if a
+   single CDN path moves. */
+(function () {
+  var DEPS = [
+  {
+    "name": "React",
+    "global": "React",
+    "urls": [
+      "https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js",
+      "https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"
+    ]
+  },
+  {
+    "name": "ReactDOM",
+    "global": "ReactDOM",
+    "urls": [
+      "https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js",
+      "https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"
+    ]
+  },
+  {
+    "name": "PropTypes",
+    "global": "PropTypes",
+    "urls": [
+      "https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"
+    ]
+  },
+  {
+    "name": "Babel",
+    "global": "Babel",
+    "urls": [
+      "https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js",
+      "https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.25.6/babel.min.js",
+      "https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js",
+      "https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.22.9/babel.min.js"
+    ]
+  }
+];
+
+  function loadOne(url) {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = url;
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error('failed: ' + url)); };
+      document.head.appendChild(s);
+    });
+  }
+
+  function loadDep(dep) {
+    if (window[dep.global]) return Promise.resolve();
+    var i = 0;
+    function attempt() {
+      if (i >= dep.urls.length) {
+        return Promise.reject(new Error(dep.name + ' could not be loaded'));
+      }
+      var url = dep.urls[i++];
+      return loadOne(url).then(function () {
+        if (!window[dep.global]) return attempt();
+      }, attempt);
+    }
+    return attempt();
+  }
+
+  function fail(msg) {
+    document.getElementById('root').innerHTML =
+      '<div class="boot"><h1>Could not start</h1><p>' + msg + '</p>' +
+      '<p><code>Check your network connection, then reload. No journal data is lost — ' +
+      'everything you have logged stays in storage.</code></p></div>';
+  }
+
+  DEPS.reduce(function (chain, dep) {
+    return chain.then(function () { return loadDep(dep); });
+  }, Promise.resolve())
+    .then(function () {
+      var src = document.getElementById('app-source').textContent;
+      var out = Babel.transform(src, { presets: ['react'] }).code;
+      var el = document.createElement('script');
+      el.textContent = out;
+      document.body.appendChild(el);
+    })
+    .catch(function (e) {
+      fail((e && e.message ? e.message : String(e)) +
+        '. The app needs React and Babel to render.');
+    });
+
+  window.addEventListener('error', function (ev) {
+    if (document.getElementById('root').childElementCount === 0) {
+      fail('Runtime error: ' + (ev.message || 'unknown'));
+    }
+  });
+})();
+</script>
+</body>
+</html>
