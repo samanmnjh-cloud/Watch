@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v3';
+const APP_VERSION = 'v4';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -292,9 +292,27 @@ function MarketIcon({ src, size = 26 }) {
 /* ------------------------------------------------------------- the API */
 const POS_URL = (w) => 'https://data-api.polymarket.com/positions?user=' +
   encodeURIComponent(w) + '&limit=500';
-const ACT_URL = (w, off) => 'https://data-api.polymarket.com/activity?user=' +
-  encodeURIComponent(w) + '&type=TRADE&limit=500&offset=' + off +
-  '&sortBy=TIMESTAMP&sortDirection=DESC';
+/* Activity moved to v2 on 24 Oct 2026; the old path answers 410 Gone. v2
+   pages by cursor rather than offset, wraps the rows in {data, pagination}
+   and renames every field to snake_case. */
+const ACT_URL = (w, since, cursor) => 'https://data-api.polymarket.com/v2/activity?user=' +
+  encodeURIComponent(w) + '&type=TRADE&limit=500' +
+  (since ? '&start=' + Math.floor(since) : '') +
+  (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+
+/* Back to the names the rest of this file already speaks. */
+function normalizeTrade(r) {
+  return {
+    timestamp: r.timestamp, conditionId: r.condition_id || r.conditionId || '',
+    type: r.type || '', size: r.size, price: r.price,
+    usdcSize: r.usdc_size != null ? r.usdc_size : r.usdcSize,
+    asset: r.token_id || r.asset || '', side: r.side || '',
+    outcome: r.outcome || '', title: r.title || '', slug: r.slug || '',
+    eventSlug: r.event_slug || r.eventSlug || '',
+    icon: r.icon || r.image || null,
+    transactionHash: r.transaction_hash || r.transactionHash || '',
+  };
+}
 
 const OFFLINE = (typeof location !== 'undefined' && /^(file|blob):/.test(location.protocol));
 
@@ -327,7 +345,7 @@ function viaRelay(url) {
     : RELAY + encodeURIComponent(url);
 }
 
-async function getJSON(target) {
+async function getAny(target) {
   const url = viaRelay(target);
   let res;
   try { res = await fetch(url); }
@@ -342,8 +360,13 @@ async function getJSON(target) {
   let j;
   try { j = await res.json(); }
   catch (e) { const x = new Error('Polymarket sent something that is not data'); x.plain = true; throw x; }
+  return j;
+}
+
+/* Most calls just want the list, however it arrived. */
+async function getJSON(target) {
+  const j = await getAny(target);
   if (Array.isArray(j)) return j;
-  /* Some responses wrap the list; take it rather than giving up on it. */
   for (const k of ['data', 'positions', 'results', 'activity']) {
     if (Array.isArray(j && j[k])) return j[k];
   }
@@ -354,13 +377,21 @@ async function getJSON(target) {
 /* Trades, newest first, as far back as the widest window anyone can pick. */
 async function fetchTrades(wallet, sinceSec) {
   const out = [];
-  for (let page = 0; page < 8; page++) {
-    const batch = await getJSON(ACT_URL(wallet, page * 500));
-    out.push(...batch);
-    if (batch.length < 500) break;
-    const last = batch[batch.length - 1];
-    if (last && num(last.timestamp) < sinceSec) break;
+  let cursor = null;
+  for (let page = 0; page < 10; page++) {
+    const body = await getAny(ACT_URL(wallet, sinceSec, cursor));
+    const rows = Array.isArray(body) ? body
+      : (body && Array.isArray(body.data) ? body.data : []);
+    rows.forEach((r) => {
+      if (!r || typeof r !== 'object') return;
+      const t = normalizeTrade(r);
+      if (t.type && t.type !== 'TRADE') return;
+      out.push(t);
+    });
+    cursor = (body && body.pagination && body.pagination.next_cursor) || null;
+    if (!cursor || rows.length === 0) break;
   }
+  out.sort((a, b) => num(b.timestamp) - num(a.timestamp));
   return out;
 }
 
