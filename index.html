@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v6';
+const APP_VERSION = 'v7';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -295,7 +295,7 @@ function MarketIcon({ src, size = 26 }) {
    status defaults to OPEN, which includes a settled winner you have not
    redeemed yet, so a resolved market still shows up and can be flagged. */
 const POS_URL = (w, cursor) => 'https://data-api.polymarket.com/v2/positions?user=' +
-  encodeURIComponent(w) + '&limit=500' +
+  encodeURIComponent(w) + '&limit=200' +
   (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
 
 /* Back to the names this file speaks. Old spellings are kept as fallbacks so
@@ -347,7 +347,7 @@ async function fetchPositions(wallet) {
    pages by cursor rather than offset, wraps the rows in {data, pagination}
    and renames every field to snake_case. */
 const ACT_URL = (w, since, cursor) => 'https://data-api.polymarket.com/v2/activity?user=' +
-  encodeURIComponent(w) + '&type=TRADE&limit=500' +
+  encodeURIComponent(w) + '&type=TRADE&limit=200' +
   (since ? '&start=' + Math.floor(since) : '') +
   (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
 
@@ -374,7 +374,7 @@ const OFFLINE = (typeof location !== 'undefined' && /^(file|blob):/.test(locatio
 function readError(err) {
   const m = (err && err.message) || String(err || 'failed');
   if (err && (err.name === 'TypeError' || /load failed|failed to fetch|networkerror/i.test(m))) {
-    return OFFLINE
+    return (OFFLINE && !RELAY)
       ? 'the page is open as a file, so the browser blocks Polymarket — open it from your web address instead'
       : RELAY
         ? 'your relay could not be reached (' + m + ') — check the address in Connection'
@@ -389,24 +389,75 @@ function readError(err) {
    the data server-side and hands it back with permission attached. */
 let RELAY = '';
 function setRelay(v) { RELAY = String(v || '').trim(); }
-function viaRelay(url) {
-  if (!RELAY) return url;
-  return RELAY.indexOf('{url}') >= 0
-    ? RELAY.replace('{url}', encodeURIComponent(url))
-    : RELAY + encodeURIComponent(url);
+
+/* A public relay is a shared service. Ask it for a dozen big pages back to
+   back and it starts refusing, and a refusal without permission headers
+   reaches the page as a bare network failure — the same shape as being
+   offline. So: space the calls out, retry a failure a couple of times, and
+   if a public relay keeps saying no, try the other public one. A relay you
+   set up yourself is never swapped out from under you. */
+const PUBLIC_RELAYS = [
+  'https://api.allorigins.win/raw?url=',
+  'https://api.codetabs.com/v1/proxy?quest=',
+];
+const GAP_MS = 350;         // breathing room between calls
+const TRIES = 3;
+
+let lastCall = 0;
+async function pace() {
+  const wait = lastCall + GAP_MS - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastCall = Date.now();
+}
+
+function relayChain() {
+  if (!RELAY) return [''];
+  const mine = PUBLIC_RELAYS.indexOf(RELAY) < 0;
+  if (mine) return [RELAY];            // your own relay, used and nothing else
+  return [RELAY].concat(PUBLIC_RELAYS.filter((r) => r !== RELAY));
+}
+
+function through(relay, url) {
+  if (!relay) return url;
+  return relay.indexOf('{url}') >= 0
+    ? relay.replace('{url}', encodeURIComponent(url))
+    : relay + encodeURIComponent(url);
 }
 
 async function getAny(target) {
-  const url = viaRelay(target);
+  const chain = relayChain();
+  let last = null;
+  for (let c = 0; c < chain.length; c++) {
+    for (let attempt = 0; attempt < TRIES; attempt++) {
+      await pace();
+      try { return await once(through(chain[c], target)); }
+      catch (e) {
+        last = e;
+        /* A clear answer from Polymarket is final; only a blocked or
+           overloaded relay is worth trying again. */
+        if (e && e.fatal) throw e;
+        if (attempt < TRIES - 1) {
+          await new Promise((r) => setTimeout(r, 700 * Math.pow(2, attempt)));
+        }
+      }
+    }
+  }
+  throw last || new Error('could not reach Polymarket');
+}
+
+async function once(url) {
   let res;
   try { res = await fetch(url); }
   catch (e) { const x = new Error(readError(e)); x.plain = true; throw x; }
   if (!res.ok) {
     const x = new Error(res.status === 400
       ? 'Polymarket says that address is not valid (400)'
-      : res.status === 429 ? 'Polymarket is rate-limiting (429) — wait a minute and sync again'
+      : res.status === 429 || res.status === 503
+      ? 'the relay is busy (' + res.status + ') — try again in a minute'
       : 'Polymarket returned ' + res.status + ' ' + (res.statusText || ''));
-    x.plain = true; throw x;
+    x.plain = true;
+    x.fatal = res.status === 400 || res.status === 403 || res.status === 404;
+    throw x;
   }
   let j;
   try { j = await res.json(); }
@@ -1315,7 +1366,8 @@ function App() {
     const failed = [];
     for (let i = 0; i < ws.length; i++) {
       const w = ws[i];
-      setStatus({ kind: 'info', text: 'Reading ' + w.label + ' — ' + (i + 1) + ' of ' + ws.length + '…' });
+      setStatus({ kind: 'info', text: 'Reading ' + w.label + ' — ' + (i + 1) +
+        ' of ' + ws.length + '…' + (RELAY ? ' (through the relay, so give it a moment)' : '') });
       try {
         const raw = await fetchPositions(w.addr);
         nb[w.id] = bookFrom(raw);
