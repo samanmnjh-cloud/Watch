@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v1';
+const APP_VERSION = 'v3';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -238,6 +238,7 @@ const K_BOOKS = 'ww_books';
 const K_EVENTS = 'ww_events';
 const K_WATCH = 'ww_watch';
 const K_PREFS = 'ww_prefs';
+const K_RELAY = 'ww_relay';
 
 /* ------------------------------------------------------------- helpers */
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
@@ -306,12 +307,28 @@ function readError(err) {
   if (err && (err.name === 'TypeError' || /load failed|failed to fetch|networkerror/i.test(m))) {
     return OFFLINE
       ? 'the page is open as a file, so the browser blocks Polymarket — open it from your web address instead'
-      : 'the browser blocked the request before it reached Polymarket (' + m + ')';
+      : RELAY
+        ? 'your relay could not be reached (' + m + ') — check the address in Connection'
+        : 'Polymarket does not answer browsers on other sites. Set up a relay once in Connection and this works for good.';
   }
   return m;
 }
 
-async function getJSON(url) {
+/* Polymarket's data API answers a browser only on their own site. From
+   anywhere else the browser refuses the reply before the page sees it, so a
+   relay has to stand in the middle: a web address of your own that fetches
+   the data server-side and hands it back with permission attached. */
+let RELAY = '';
+function setRelay(v) { RELAY = String(v || '').trim(); }
+function viaRelay(url) {
+  if (!RELAY) return url;
+  return RELAY.indexOf('{url}') >= 0
+    ? RELAY.replace('{url}', encodeURIComponent(url))
+    : RELAY + encodeURIComponent(url);
+}
+
+async function getJSON(target) {
+  const url = viaRelay(target);
   let res;
   try { res = await fetch(url); }
   catch (e) { const x = new Error(readError(e)); x.plain = true; throw x; }
@@ -1039,6 +1056,98 @@ function AddWallet({ onSave, onClose, taken }) {
   );
 }
 
+
+/* ------------------------------------------------------ the connection */
+const RELAY_PRESETS = [
+  { id: 'allorigins', label: 'Public relay (allorigins.win)',
+    url: 'https://api.allorigins.win/raw?url=',
+    note: 'Nothing to set up. A stranger\u2019s server sees which wallets you look at \u2014 all public information, and it can never move funds. It can be slow or busy.' },
+  { id: 'codetabs', label: 'Public relay (codetabs.com)',
+    url: 'https://api.codetabs.com/v1/proxy?quest=',
+    note: 'A second one to fall back on if the first is down. Same trade-off.' },
+];
+
+function ConnectionModal({ value, onSave, onClose }) {
+  const [v, setV] = useState(value || '');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const inp = { width: '100%', border: '1px solid ' + C.border, borderRadius: 7,
+    padding: '9px 11px', font: 'inherit', fontSize: 12.5, fontFamily: MONO,
+    outline: 'none', marginTop: 6 };
+
+  /* A real wallet with real positions, so a pass means a pass. */
+  const test = async () => {
+    setBusy(true); setResult(null);
+    const probe = 'https://data-api.polymarket.com/positions?user=' +
+      '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b&limit=3';
+    const t = String(v || '').trim();
+    const url = !t ? probe
+      : t.indexOf('{url}') >= 0 ? t.replace('{url}', encodeURIComponent(probe))
+      : t + encodeURIComponent(probe);
+    try {
+      const res = await fetch(url);
+      if (!res.ok) { setResult({ ok: false, m: 'The relay answered ' + res.status + '.' }); }
+      else {
+        const j = await res.json();
+        const arr = Array.isArray(j) ? j
+          : (j && (j.data || j.positions || j.results)) || null;
+        setResult(Array.isArray(arr)
+          ? { ok: true, m: 'Working \u2014 read ' + arr.length + ' position' + (arr.length === 1 ? '' : 's') + '.' }
+          : { ok: false, m: 'It answered, but not with Polymarket data.' });
+      }
+    } catch (e) {
+      setResult({ ok: false, m: t
+        ? 'Could not reach that address.'
+        : 'Blocked, as expected \u2014 pick or paste a relay above.' });
+    }
+    setBusy(false);
+  };
+
+  return (
+    <Modal title="Connection" onClose={onClose}>
+      <Tiny style={{ display: 'block', lineHeight: 1.55 }}>
+        Polymarket only answers browsers on polymarket.com. To read it from here the
+        page needs a relay \u2014 an address that fetches the data for it and passes it back.
+      </Tiny>
+
+      <div style={{ marginTop: 16, display: 'grid', gap: 8 }}>
+        {RELAY_PRESETS.map((r) => (
+          <button key={r.id} onClick={() => { setV(r.url); setResult(null); }}
+            style={{ textAlign: 'left', cursor: 'pointer', font: 'inherit',
+              border: '1px solid ' + (v === r.url ? C.blue : C.border),
+              background: v === r.url ? C.blue + '0C' : C.card,
+              borderRadius: 8, padding: '10px 12px' }}>
+            <div style={{ fontSize: 13, fontWeight: 650 }}>{r.label}</div>
+            <Tiny style={{ display: 'block', marginTop: 3, lineHeight: 1.5 }}>{r.note}</Tiny>
+          </button>
+        ))}
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <label style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.6,
+          textTransform: 'uppercase', color: C.ink2 }}>Relay address</label>
+        <input value={v} onChange={(e) => { setV(e.target.value); setResult(null); }}
+          placeholder="https://\u2026/?url=" style={inp} />
+        <Tiny style={{ display: 'block', marginTop: 6, lineHeight: 1.5 }}>
+          Your own relay goes here too \u2014 paste it ending in <code>?url=</code>.
+          Leave it empty to call Polymarket directly.
+        </Tiny>
+      </div>
+
+      {result && (
+        <div style={{ marginTop: 12, fontSize: 12.5, fontWeight: 600,
+          color: result.ok ? C.green : C.red }}>{result.m}</div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+        <Btn kind="primary" onClick={() => onSave(String(v || '').trim())}>Save</Btn>
+        <Btn onClick={test} disabled={busy}>{busy ? 'Testing\u2026' : 'Test it'}</Btn>
+        <Btn onClick={onClose}>Cancel</Btn>
+      </div>
+    </Modal>
+  );
+}
+
 /* ----------------------------------------------------------- the app */
 function App() {
   const [ready, setReady] = useState(false);
@@ -1052,6 +1161,8 @@ function App() {
   const [hidden, setHidden] = useState({});
   const [focus, setFocus] = useState(null);
   const [adding, setAdding] = useState(false);
+  const [conn, setConn] = useState(false);
+  const [relay, setRelayV] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [status, setStatus] = useState(OFFLINE
     ? { kind: 'error', text: 'This page is open as a file, so the browser will not let it reach ' +
@@ -1072,6 +1183,8 @@ function App() {
       const e = await Store.get(K_EVENTS, {});
       const t = await Store.get(K_WATCH, []);
       const p = await Store.get(K_PREFS, null);
+      const rl = await Store.get(K_RELAY, '');
+      setRelay(rl); setRelayV(typeof rl === 'string' ? rl : '');
       wRef.current = Array.isArray(w) ? w : []; setWallets(wRef.current);
       bRef.current = (b && typeof b === 'object') ? b : {}; setBooks(bRef.current);
       eRef.current = (e && typeof e === 'object') ? e : {}; setEvents(eRef.current);
@@ -1237,6 +1350,9 @@ function App() {
               <Chip key={x.h} on={win === x.h} onClick={() => setWin(x.h)}>{x.l}</Chip>
             ))}
           </span>
+          <Btn onClick={() => setConn(true)} title="How this page reaches Polymarket">
+            {relay ? 'Connection ✓' : 'Connection'}
+          </Btn>
           <Btn kind="primary" onClick={sync} disabled={syncing || !wallets.length}>
             {syncing ? 'Syncing…' : 'Sync'}
           </Btn>
@@ -1251,6 +1367,13 @@ function App() {
                 {status.kind === 'error' ? '!' : status.kind === 'ok' ? '✓' : '…'}
               </span>
               <span>{status.text}</span>
+              {status.kind === 'error' && /relay|Connection/i.test(status.text) && (
+                <button onClick={() => setConn(true)} style={{ font: 'inherit', fontSize: 12.5,
+                  fontWeight: 700, color: C.red, background: 'none', border: 'none',
+                  textDecoration: 'underline', cursor: 'pointer', padding: 0, flexShrink: 0 }}>
+                  Fix it
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -1286,6 +1409,11 @@ function App() {
         )}
       </div>
 
+      {conn && <ConnectionModal value={relay}
+        onSave={(v) => { setRelay(v); setRelayV(v); Store.set(K_RELAY, v); setConn(false);
+          setStatus({ kind: 'info', text: v ? 'Relay saved \u2014 press Sync.'
+            : 'Relay cleared \u2014 calls go straight to Polymarket.' }); }}
+        onClose={() => setConn(false)} />}
       {adding && <AddWallet onSave={addWallet} onClose={() => setAdding(false)}
         taken={wallets.map((w) => w.addr)} />}
     </div>
