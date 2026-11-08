@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v5';
+const APP_VERSION = 'v6';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -290,8 +290,59 @@ function MarketIcon({ src, size = 26 }) {
 }
 
 /* ------------------------------------------------------------- the API */
-const POS_URL = (w) => 'https://data-api.polymarket.com/positions?user=' +
-  encodeURIComponent(w) + '&limit=500';
+/* Positions moved to v2 with everything else. Snake_case rows in a
+   {data, pagination} envelope, paged by cursor — sending offset is a 400.
+   status defaults to OPEN, which includes a settled winner you have not
+   redeemed yet, so a resolved market still shows up and can be flagged. */
+const POS_URL = (w, cursor) => 'https://data-api.polymarket.com/v2/positions?user=' +
+  encodeURIComponent(w) + '&limit=500' +
+  (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+
+/* Back to the names this file speaks. Old spellings are kept as fallbacks so
+   a row from either generation of the API reads the same. */
+function normalizePosition(r) {
+  const pick = (...names) => {
+    for (const n of names) if (r[n] !== undefined && r[n] !== null) return r[n];
+    return undefined;
+  };
+  return {
+    conditionId: pick('condition_id', 'conditionId') || '',
+    asset: pick('token_id', 'asset') || '',
+    title: pick('title', 'market_title', 'question') || '',
+    slug: pick('slug', 'market_slug') || '',
+    eventSlug: pick('event_slug', 'eventSlug') || '',
+    icon: pick('icon', 'image', 'imageOptimized') || null,
+    outcome: pick('outcome') || '',
+    size: num(pick('current_size', 'size')),
+    curPrice: num(pick('current_price', 'curPrice')),
+    currentValue: num(pick('current_value', 'currentValue')),
+    avgPrice: num(pick('avg_price', 'avgPrice')),
+    endDate: pick('end_date', 'endDate') || null,
+    /* A row is finished if the API says so, by flag or by status. */
+    redeemable: !!pick('redeemable') ||
+      ['CLOSED', 'REDEEMABLE', 'REDEEMABLE_LOST'].indexOf(
+        String(pick('status') || '').toUpperCase()) >= 0,
+  };
+}
+
+/* Every open position, following the cursor to the end. */
+async function fetchPositions(wallet) {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 6; page++) {
+    const body = await getAny(POS_URL(wallet, cursor));
+    const peeled = unwrapBody(body, 0);
+    const rows = listIn(peeled);
+    if (!rows) {
+      const x = new Error('Polymarket sent no positions back (' + preview(peeled) + ')');
+      x.plain = true; throw x;
+    }
+    rows.forEach((r) => { if (r && typeof r === 'object') out.push(normalizePosition(r)); });
+    cursor = (peeled && peeled.pagination && peeled.pagination.next_cursor) || null;
+    if (!cursor) break;
+  }
+  return out;
+}
 /* Activity moved to v2 on 24 Oct 2026; the old path answers 410 Gone. v2
    pages by cursor rather than offset, wraps the rows in {data, pagination}
    and renames every field to snake_case. */
@@ -385,16 +436,6 @@ function listIn(j) {
   return null;
 }
 
-/* Most calls just want the list, however it arrived. */
-async function getJSON(target) {
-  const j = await getAny(target);
-  const list = listIn(j);
-  if (list) return list;
-  const x = new Error('Polymarket sent no list of positions back (' +
-    preview(j) + ')');
-  x.plain = true; throw x;
-}
-
 /* Enough of the reply to recognise it, never enough to fill the screen. */
 function preview(j) {
   let t;
@@ -432,7 +473,7 @@ function bookFrom(raw) {
     .filter((p) => num(p.currentValue) > 0.01 && !p.redeemable)
     .map((p) => ({
       key: mkey(p), asset: p.asset, title: p.title || p.slug || 'Untitled market',
-      icon: p.icon || p.imageOptimized || null, slug: p.slug || '', eventSlug: p.eventSlug || '',
+      icon: p.icon || null, slug: p.slug || '', eventSlug: p.eventSlug || '',
       outcome: String(p.outcome || '').toUpperCase(), shares: num(p.size),
       price: num(p.curPrice), value: num(p.currentValue), endDate: p.endDate || null,
     }));
@@ -1138,7 +1179,7 @@ function ConnectionModal({ value, onSave, onClose }) {
   /* A real wallet with real positions, so a pass means a pass. */
   const test = async () => {
     setBusy(true); setResult(null);
-    const probe = 'https://data-api.polymarket.com/positions?user=' +
+    const probe = 'https://data-api.polymarket.com/v2/positions?user=' +
       '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b&limit=3';
     const t = String(v || '').trim();
     const url = !t ? probe
@@ -1276,7 +1317,7 @@ function App() {
       const w = ws[i];
       setStatus({ kind: 'info', text: 'Reading ' + w.label + ' — ' + (i + 1) + ' of ' + ws.length + '…' });
       try {
-        const raw = await getJSON(POS_URL(w.addr));
+        const raw = await fetchPositions(w.addr);
         nb[w.id] = bookFrom(raw);
         const held = {};
         (raw || []).forEach((p) => { held[p.asset] = num(p.size); });
