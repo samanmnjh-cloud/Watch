@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v4';
+const APP_VERSION = 'v5';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -363,15 +363,44 @@ async function getAny(target) {
   return j;
 }
 
+/* A relay may hand back the real answer inside an envelope of its own, and
+   sometimes as a string rather than parsed. Peel until there is data. */
+function unwrapBody(j, depth) {
+  if (typeof j === 'string') {
+    try { return unwrapBody(JSON.parse(j), (depth || 0) + 1); } catch (e) { return j; }
+  }
+  if (!j || typeof j !== 'object' || Array.isArray(j) || (depth || 0) > 3) return j;
+  for (const k of ['contents', 'body', 'response']) {
+    if (j[k] != null) return unwrapBody(j[k], (depth || 0) + 1);
+  }
+  return j;
+}
+
+function listIn(j) {
+  const b = unwrapBody(j, 0);
+  if (Array.isArray(b)) return b;
+  for (const k of ['data', 'positions', 'results', 'activity', 'items']) {
+    if (Array.isArray(b && b[k])) return b[k];
+  }
+  return null;
+}
+
 /* Most calls just want the list, however it arrived. */
 async function getJSON(target) {
   const j = await getAny(target);
-  if (Array.isArray(j)) return j;
-  for (const k of ['data', 'positions', 'results', 'activity']) {
-    if (Array.isArray(j && j[k])) return j[k];
-  }
-  const x = new Error('Polymarket sent no list of positions back');
+  const list = listIn(j);
+  if (list) return list;
+  const x = new Error('Polymarket sent no list of positions back (' +
+    preview(j) + ')');
   x.plain = true; throw x;
+}
+
+/* Enough of the reply to recognise it, never enough to fill the screen. */
+function preview(j) {
+  let t;
+  try { t = typeof j === 'string' ? j : JSON.stringify(j); } catch (e) { t = String(j); }
+  t = String(t == null ? '' : t).replace(/\s+/g, ' ').trim();
+  return t.length > 140 ? t.slice(0, 140) + '…' : (t || 'empty');
 }
 
 /* Trades, newest first, as far back as the widest window anyone can pick. */
@@ -380,15 +409,15 @@ async function fetchTrades(wallet, sinceSec) {
   let cursor = null;
   for (let page = 0; page < 10; page++) {
     const body = await getAny(ACT_URL(wallet, sinceSec, cursor));
-    const rows = Array.isArray(body) ? body
-      : (body && Array.isArray(body.data) ? body.data : []);
+    const peeled = unwrapBody(body, 0);
+    const rows = listIn(peeled) || [];
     rows.forEach((r) => {
       if (!r || typeof r !== 'object') return;
       const t = normalizeTrade(r);
       if (t.type && t.type !== 'TRADE') return;
       out.push(t);
     });
-    cursor = (body && body.pagination && body.pagination.next_cursor) || null;
+    cursor = (peeled && peeled.pagination && peeled.pagination.next_cursor) || null;
     if (!cursor || rows.length === 0) break;
   }
   out.sort((a, b) => num(b.timestamp) - num(a.timestamp));
@@ -1117,14 +1146,19 @@ function ConnectionModal({ value, onSave, onClose }) {
       : t + encodeURIComponent(probe);
     try {
       const res = await fetch(url);
-      if (!res.ok) { setResult({ ok: false, m: 'The relay answered ' + res.status + '.' }); }
-      else {
-        const j = await res.json();
-        const arr = Array.isArray(j) ? j
-          : (j && (j.data || j.positions || j.results)) || null;
-        setResult(Array.isArray(arr)
+      const text = await res.text();
+      let j = null, parsed = true;
+      try { j = JSON.parse(text); } catch (e) { parsed = false; }
+      if (!res.ok) {
+        setResult({ ok: false, m: 'The relay answered ' + res.status + '. ' +
+          preview(parsed ? j : text) });
+      } else if (!parsed) {
+        setResult({ ok: false, m: 'Not data at all \u2014 it sent: ' + preview(text) });
+      } else {
+        const arr = listIn(j);
+        setResult(arr
           ? { ok: true, m: 'Working \u2014 read ' + arr.length + ' position' + (arr.length === 1 ? '' : 's') + '.' }
-          : { ok: false, m: 'It answered, but not with Polymarket data.' });
+          : { ok: false, m: 'It answered with: ' + preview(j) });
       }
     } catch (e) {
       setResult({ ok: false, m: t
@@ -1166,8 +1200,8 @@ function ConnectionModal({ value, onSave, onClose }) {
       </div>
 
       {result && (
-        <div style={{ marginTop: 12, fontSize: 12.5, fontWeight: 600,
-          color: result.ok ? C.green : C.red }}>{result.m}</div>
+        <div style={{ marginTop: 12, fontSize: 12.5, fontWeight: 600, lineHeight: 1.5,
+          wordBreak: 'break-word', color: result.ok ? C.green : C.red }}>{result.m}</div>
       )}
 
       <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
