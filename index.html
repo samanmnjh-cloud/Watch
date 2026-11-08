@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v11';
+const APP_VERSION = 'v12';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -864,7 +864,90 @@ function WalletStrip({ wallets, books, counts, sel, hidden, onPick, onHide, onRe
 }
 
 /* --------------------------------------------------------- the feed */
+/* The badge next to this already says what happened, so this is only the
+   size of it — the full sentence stays on hover. */
+function amountOf(d) {
+  if (d.kind === 'EXITED') return money(d.out) + ' out';
+  if (d.out === 0) return money(d.inn);
+  if (d.inn === 0) return money(d.out);
+  return (d.net >= 0 ? '+' : '\u2212') + money(Math.abs(d.net));
+}
+
+/* The feed answers "what just happened". This answers "what has each of
+   them been doing", which a list of individual fills does not: a run of adds
+   becomes one number, reduce-then-exit becomes an exit, and a wallet that
+   bought and sold the same market shows its net. */
+function ActivitySummary({ events, wallets, byId, onOpenMarket, now }) {
+  const blocks = useMemo(() => {
+    const perWallet = {};
+    events.forEach((e) => {
+      const w = perWallet[e.w] || (perWallet[e.w] = {});
+      (w[e.key] || (w[e.key] = [])).push(e);
+    });
+    return wallets.map((w) => {
+      const markets = perWallet[w.id];
+      if (!markets) return null;
+      const rows = Object.keys(markets).map((k) => {
+        const es = markets[k];
+        const d = digest(es);
+        return d && { key: k, title: es[0].title, icon: es[0].icon,
+          outcome: es[0].outcome, d };
+      }).filter(Boolean).sort((a, b) => b.d.last - a.d.last);
+      if (!rows.length) return null;
+      const inn = rows.reduce((a, r) => a + r.d.inn, 0);
+      const out = rows.reduce((a, r) => a + r.d.out, 0);
+      const moves = rows.reduce((a, r) => a + r.d.n, 0);
+      return { w, rows, inn, out, moves };
+    }).filter(Boolean).sort((a, b) => b.rows[0].d.last - a.rows[0].d.last);
+  }, [events, wallets]);
+
+  if (!blocks.length) {
+    return <div style={{ padding: 26, textAlign: 'center', color: C.ink3, fontSize: 13 }}>
+      Nothing in this window.</div>;
+  }
+  const ROW = { display: 'grid',
+    gridTemplateColumns: '32px 50px minmax(0,1fr) 108px 86px 64px',
+    gap: 12, alignItems: 'center', padding: '11px 16px 11px 30px',
+    borderTop: '1px solid #F2F4F7', fontSize: 13.5, lineHeight: 1.45 };
+  return (
+    <div>
+      {blocks.map((b) => (
+        <div key={b.w.id} data-summary-wallet={b.w.id}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10,
+            padding: '13px 16px 9px', borderTop: '1px solid ' + C.border }}>
+            <WalletMark w={b.w} size={26} />
+            <span style={{ fontSize: 14, fontWeight: 700 }}>{b.w.label}</span>
+            <Tiny>{b.rows.length} market{b.rows.length === 1 ? '' : 's'} ·{' '}
+              {b.moves} move{b.moves === 1 ? '' : 's'}</Tiny>
+            {/* A wallet that only bought has no "out" side; printing −$0.00
+                for it reads as a number rather than as nothing. */}
+            <span style={{ marginLeft: 'auto', fontSize: 12.5 }}>
+              {b.inn > 0 && <span><span style={{ color: C.green }}>+{money(b.inn)}</span> in</span>}
+              {b.inn > 0 && b.out > 0 && ' · '}
+              {b.out > 0 && <span><span style={{ color: C.orange }}>−{money(b.out)}</span> out</span>}
+            </span>
+          </div>
+          {b.rows.map((r) => (
+            <div key={r.key} style={ROW}>
+              <MarketIcon src={r.icon} size={30} />
+              <Badge kind={r.outcome === 'YES' ? 'YES' : 'NO'} width={50} />
+              <span data-summary-market={r.key} onClick={() => onOpenMarket(r.key)} title={r.title}
+                style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                  color: C.ink2, cursor: 'pointer' }}>{r.title}</span>
+              <Badge kind={r.d.kind} />
+              <span style={{ textAlign: 'right', color: C.ink2,
+                fontWeight: 600 }} title={r.d.text}>{amountOf(r.d)}</span>
+              <Tiny style={{ textAlign: 'right' }}>{ago(r.d.last, now)}</Tiny>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, now }) {
+  const [sub, setSub] = useState('every');
   const byId = useMemo(() => {
     const m = {}; wallets.forEach((w) => { m[w.id] = w; }); return m;
   }, [wallets]);
@@ -908,13 +991,21 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
             <Chip onClick={onClearSel}>Show all</Chip>
           </React.Fragment>
         ) : <Tiny>everyone you follow · tap a card to see just one</Tiny>}
+        <span style={{ display: 'flex', gap: 6, marginLeft: 10 }}>
+          <Chip on={sub === 'every'} onClick={() => setSub('every')}>Every move</Chip>
+          <Chip on={sub === 'summary'} onClick={() => setSub('summary')}>Summary</Chip>
+        </span>
         <span style={{ marginLeft: 'auto', fontSize: 12, color: C.ink3 }}>
           {events.length} move{events.length === 1 ? '' : 's'} · {news} new ·{' '}
           <span style={{ color: C.green }}>+{money(inn)}</span> in ·{' '}
           <span style={{ color: C.orange }}>−{money(out)}</span> out
         </span>
       </CardHead>
-      {days.map((day) => (
+      {sub === 'summary' ? (
+        <ActivitySummary events={events} byId={byId} now={now}
+          wallets={sel ? wallets.filter((w) => w.id === sel) : wallets}
+          onOpenMarket={onOpenMarket} />
+      ) : days.map((day) => (
         <div key={day.d}>
           <div style={{ fontSize: 11, letterSpacing: 0.6, textTransform: 'uppercase',
             color: C.ink3, fontWeight: 700, padding: '13px 15px 6px' }}>
