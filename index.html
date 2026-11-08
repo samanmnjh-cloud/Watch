@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v7';
+const APP_VERSION = 'v11';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -239,6 +239,7 @@ const K_EVENTS = 'ww_events';
 const K_WATCH = 'ww_watch';
 const K_PREFS = 'ww_prefs';
 const K_RELAY = 'ww_relay';
+const K_SYNCED = 'ww_synced';
 
 /* ------------------------------------------------------------- helpers */
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
@@ -261,6 +262,20 @@ const WINDOWS = [{ h: 24, l: '24h' }, { h: 48, l: '2d' }, { h: 168, l: '7d' }, {
 
 /* A wallet has no picture on Polymarket, so it gets a mark of its own that is
    the same every time: four squares drawn from the address. */
+/* Polymarket knows most of these wallets by name and face. Use that when it
+   exists and fall back to a mark generated from the address, so a wallet is
+   never just a row of hex. */
+function WalletMark({ w, size = 26 }) {
+  const [bad, setBad] = useState(false);
+  useEffect(() => { setBad(false); }, [w && w.avatar]);
+  if (w && w.avatar && !bad) {
+    return <img src={w.avatar} alt="" width={size} height={size} onError={() => setBad(true)}
+      style={{ width: size, height: size, borderRadius: 7, flexShrink: 0, objectFit: 'cover',
+        border: '1px solid ' + (w.colour || C.gray) + '55', display: 'block' }} />;
+  }
+  return <Identicon addr={w && w.addr} colour={w && w.colour} size={size} />;
+}
+
 function Identicon({ addr, colour, size = 26 }) {
   const cells = useMemo(() => {
     const h = String(addr || '').toLowerCase().replace(/[^0-9a-f]/g, '');
@@ -295,7 +310,7 @@ function MarketIcon({ src, size = 26 }) {
    status defaults to OPEN, which includes a settled winner you have not
    redeemed yet, so a resolved market still shows up and can be flagged. */
 const POS_URL = (w, cursor) => 'https://data-api.polymarket.com/v2/positions?user=' +
-  encodeURIComponent(w) + '&limit=200' +
+  encodeURIComponent(w) + '&limit=' + pageSize() +
   (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
 
 /* Back to the names this file speaks. Old spellings are kept as fallbacks so
@@ -325,29 +340,45 @@ function normalizePosition(r) {
   };
 }
 
-/* Every open position, following the cursor to the end. */
+/* Every open position, following the cursor to the end. The rows also carry
+   who the wallet belongs to, so the owner comes back with them. */
 async function fetchPositions(wallet) {
   const out = [];
+  let owner = null;
   let cursor = null;
   for (let page = 0; page < 6; page++) {
-    const body = await getAny(POS_URL(wallet, cursor));
+    const body = await getAny(POS_URL(wallet, cursor),
+      'positions' + (page ? ', page ' + (page + 1) : ''));
     const peeled = unwrapBody(body, 0);
     const rows = listIn(peeled);
     if (!rows) {
       const x = new Error('Polymarket sent no positions back (' + preview(peeled) + ')');
       x.plain = true; throw x;
     }
-    rows.forEach((r) => { if (r && typeof r === 'object') out.push(normalizePosition(r)); });
+    rows.forEach((r) => {
+      if (!r || typeof r !== 'object') return;
+      if (!owner) owner = ownerFrom(r);
+      out.push(normalizePosition(r));
+    });
     cursor = (peeled && peeled.pagination && peeled.pagination.next_cursor) || null;
     if (!cursor) break;
   }
-  return out;
+  return { pos: out, owner };
+}
+
+/* A row says who holds it. Pseudonyms are Polymarket's own invention for
+   wallets that never picked a name, and are still better than hex. */
+function ownerFrom(r) {
+  const name = String((r && (r.name || r.pseudonym)) || '').trim();
+  const avatar = String((r && (r.profile_image || r.profileImage)) || '').trim();
+  if (!name && !avatar) return null;
+  return { name: name || '', avatar: avatar || '', verified: !!(r && r.verified) };
 }
 /* Activity moved to v2 on 24 Oct 2026; the old path answers 410 Gone. v2
    pages by cursor rather than offset, wraps the rows in {data, pagination}
    and renames every field to snake_case. */
 const ACT_URL = (w, since, cursor) => 'https://data-api.polymarket.com/v2/activity?user=' +
-  encodeURIComponent(w) + '&type=TRADE&limit=200' +
+  encodeURIComponent(w) + '&type=TRADE&limit=' + pageSize() +
   (since ? '&start=' + Math.floor(since) : '') +
   (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
 
@@ -362,6 +393,8 @@ function normalizeTrade(r) {
     eventSlug: r.event_slug || r.eventSlug || '',
     icon: r.icon || r.image || null,
     transactionHash: r.transaction_hash || r.transactionHash || '',
+    name: r.name || '', pseudonym: r.pseudonym || '',
+    profile_image: r.profile_image || '',
   };
 }
 
@@ -400,12 +433,23 @@ const PUBLIC_RELAYS = [
   'https://api.allorigins.win/raw?url=',
   'https://api.codetabs.com/v1/proxy?quest=',
 ];
-const GAP_MS = 350;         // breathing room between calls
+/* Talking straight to Polymarket there is no reason to hold back. Through
+   a shared relay there is every reason: smaller pages, and a gap between
+   calls so it does not start refusing. */
+const gap = () => (RELAY ? 350 : 0);
+const pageSize = () => (RELAY ? 200 : 500);
 const TRIES = 3;
+const TIMEOUT_MS = 22000;   // a relay that hangs is a relay that has failed
+
+/* Set while a sync is running so the page can say what it is waiting on,
+   and cleared to call the whole thing off. */
+const Progress = { say: null, stopped: false };
+function tell(text) { if (Progress.say) Progress.say(text); }
+function stopped() { return Progress.stopped; }
 
 let lastCall = 0;
 async function pace() {
-  const wait = lastCall + GAP_MS - Date.now();
+  const wait = lastCall + gap() - Date.now();
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   lastCall = Date.now();
 }
@@ -424,19 +468,25 @@ function through(relay, url) {
     : relay + encodeURIComponent(url);
 }
 
-async function getAny(target) {
+async function getAny(target, label) {
   const chain = relayChain();
+  const what = label || 'Polymarket';
   let last = null;
   for (let c = 0; c < chain.length; c++) {
     for (let attempt = 0; attempt < TRIES; attempt++) {
+      if (stopped()) { const x = new Error('stopped'); x.stop = true; throw x; }
       await pace();
+      tell(what + (attempt ? ' \u2014 try ' + (attempt + 1) + ' of ' + TRIES : '') +
+        (c ? ' (backup relay)' : ''));
       try { return await once(through(chain[c], target)); }
       catch (e) {
         last = e;
-        /* A clear answer from Polymarket is final; only a blocked or
+        if (e && e.stop) throw e;
+        /* A clear answer from Polymarket is final; only a blocked, slow or
            overloaded relay is worth trying again. */
         if (e && e.fatal) throw e;
         if (attempt < TRIES - 1) {
+          tell(what + ' \u2014 no answer, waiting to try again');
           await new Promise((r) => setTimeout(r, 700 * Math.pow(2, attempt)));
         }
       }
@@ -445,10 +495,22 @@ async function getAny(target) {
   throw last || new Error('could not reach Polymarket');
 }
 
+/* One attempt, with a deadline. Without one a relay can simply never
+   answer, and the sync waits for it until the end of time. */
 async function once(url) {
+  const ac = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer = null, timedOut = false;
+  if (ac) timer = setTimeout(() => { timedOut = true; ac.abort(); }, TIMEOUT_MS);
   let res;
-  try { res = await fetch(url); }
-  catch (e) { const x = new Error(readError(e)); x.plain = true; throw x; }
+  try { res = await fetch(url, ac ? { signal: ac.signal } : undefined); }
+  catch (e) {
+    if (timer) clearTimeout(timer);
+    const x = new Error(timedOut
+      ? 'no answer in ' + Math.round(TIMEOUT_MS / 1000) + ' seconds'
+      : readError(e));
+    x.plain = true; throw x;
+  }
+  if (timer) clearTimeout(timer);
   if (!res.ok) {
     const x = new Error(res.status === 400
       ? 'Polymarket says that address is not valid (400)'
@@ -500,7 +562,8 @@ async function fetchTrades(wallet, sinceSec) {
   const out = [];
   let cursor = null;
   for (let page = 0; page < 10; page++) {
-    const body = await getAny(ACT_URL(wallet, sinceSec, cursor));
+    const body = await getAny(ACT_URL(wallet, sinceSec, cursor),
+      'trade history' + (page ? ', page ' + (page + 1) : ''));
     const peeled = unwrapBody(body, 0);
     const rows = listIn(peeled) || [];
     rows.forEach((r) => {
@@ -536,6 +599,25 @@ function bookFrom(raw) {
       (num(p.curPrice, -1) >= 0 && (num(p.curPrice) <= 0.0005 || num(p.curPrice) >= 0.9995)))
     .map((p) => mkey(p));
   return { at: Date.now(), tot, pos, resolved: done };
+}
+
+/* Two runs of history, joined. The fresh copy wins where they overlap,
+   because it was read against today's holdings; anything older than the
+   window falls off the end. The same fill can arrive from either side, so
+   identity is the transaction plus what it did, not the object. */
+function mergeEvents(kept, fresh, floor) {
+  const idOf = (e) => [e.hash || '', e.asset || '', e.at, e.side, e.shares].join('|');
+  const seen = {};
+  const out = [];
+  (fresh || []).forEach((e) => {
+    const k = idOf(e);
+    if (!seen[k]) { seen[k] = 1; out.push(e); }
+  });
+  (kept || []).forEach((e) => {
+    const k = idOf(e);
+    if (!seen[k] && e.at >= floor) { seen[k] = 1; out.push(e); }
+  });
+  return out.sort((a, b) => b.at - a.at);
 }
 
 /* A trade only becomes Added, Reduced, New or Exited once you know what the
@@ -648,8 +730,8 @@ function Badge({ kind, width }) {
   const t = BDG[kind] || BDG.EXITED;
   return (
     <span style={{ display: 'inline-block', width: width || '100%', textAlign: 'center',
-      fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, borderRadius: 4, padding: '3px 0',
-      lineHeight: 1.25, color: t.c, background: t.c + '14', border: '1px solid ' + t.c + '30',
+      fontSize: 11.5, fontWeight: 700, letterSpacing: 0.4, borderRadius: 4, padding: '4px 0',
+      lineHeight: 1.3, color: t.c, background: t.c + '14', border: '1px solid ' + t.c + '30',
     }}>{kind}</span>
   );
 }
@@ -666,7 +748,7 @@ function CardHead({ children }) {
     borderBottom: '1px solid ' + C.border, background: C.cardAlt, flexWrap: 'wrap' }}>{children}</div>;
 }
 const Tiny = ({ children, style }) => (
-  <span style={Object.assign({ fontSize: 11, color: C.ink3 }, style)}>{children}</span>
+  <span style={Object.assign({ fontSize: 12, color: C.ink3 }, style)}>{children}</span>
 );
 
 /* share of that wallet's own book, read the same way everywhere */
@@ -726,6 +808,12 @@ const PLUS = (
     strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
 );
 
+const REDO = (
+  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+    strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 12a9 9 0 1 0 2.6-6.4" /><path d="M3 4v5h5" /></svg>
+);
+
 function WalletStrip({ wallets, books, counts, sel, hidden, onPick, onHide, onRemove, onAdd }) {
   return (
     <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
@@ -740,7 +828,7 @@ function WalletStrip({ wallets, books, counts, sel, hidden, onPick, onHide, onRe
               boxShadow: isSel ? '0 0 0 2px ' + C.blue + '22' : 'none',
               opacity: isHid ? 0.42 : 1, padding: '11px 13px', cursor: isHid ? 'default' : 'pointer' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
-              <Identicon addr={w.addr} colour={w.colour} size={26} />
+              <WalletMark w={w} size={30} />
               <span style={{ fontSize: 13, fontWeight: 700, minWidth: 0, overflow: 'hidden',
                 textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{w.label}</span>
               {w.mine && <span style={{ fontSize: 9.5, letterSpacing: 0.5, textTransform: 'uppercase',
@@ -802,9 +890,9 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
   /* who did it, then what it was done to: the wallet's own mark sits beside
      the market's picture so a row never has to be read to be placed. */
   const ROW = { display: 'grid',
-    gridTemplateColumns: '56px 20px 24px 84px 46px minmax(0,1fr) 116px 76px 88px',
-    gap: 9, alignItems: 'center', padding: '7px 15px', borderTop: '1px solid #F2F4F7',
-    fontSize: 12.5 };
+    gridTemplateColumns: '60px 24px 32px 88px 50px minmax(0,1fr) 124px 82px 94px',
+    gap: 10, alignItems: 'center', padding: '11px 16px', borderTop: '1px solid #F2F4F7',
+    fontSize: 13.5, lineHeight: 1.45 };
   return (
     <Card>
       <CardHead>
@@ -819,7 +907,7 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
             </span>
             <Chip onClick={onClearSel}>Show all</Chip>
           </React.Fragment>
-        ) : <Tiny>every wallet · tap a card to see just one</Tiny>}
+        ) : <Tiny>everyone you follow · tap a card to see just one</Tiny>}
         <span style={{ marginLeft: 'auto', fontSize: 12, color: C.ink3 }}>
           {events.length} move{events.length === 1 ? '' : 's'} · {news} new ·{' '}
           <span style={{ color: C.green }}>+{money(inn)}</span> in ·{' '}
@@ -842,8 +930,8 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
             return (
               <div key={e.at + '-' + e.asset + '-' + i} style={ROW}>
                 <Tiny>{ago(e.at, now)}</Tiny>
-                <Identicon addr={w.addr} colour={w.colour} size={20} />
-                <MarketIcon src={e.icon} size={24} />
+                <WalletMark w={w} size={24} />
+                <MarketIcon src={e.icon} size={32} />
                 <Badge kind={e.kind} />
                 <Badge kind={e.outcome === 'YES' ? 'YES' : 'NO'} width={46} />
                 <span data-market={e.key} onClick={() => onOpenMarket(e.key)} title={e.title}
@@ -875,12 +963,12 @@ function MarketRow({ m, wallets, books, events, watched, onToggleWatch, onOpen, 
   const holders = m.holders;
   const tot = holders.reduce((a, h) => a + h.value, 0);
   const outs = {}; holders.forEach((h) => { outs[h.outcome] = 1; });
-  const split = Object.keys(outs).length > 1;
   const mine = events.filter((e) => e.key === m.key);
   const biggest = Math.max.apply(null, holders.map((h) => h.pct).concat([0.0001]));
   const ROW = { display: 'grid',
-    gridTemplateColumns: '26px minmax(0,1fr) 54px 190px 86px 68px 26px',
-    gap: 11, alignItems: 'center', padding: '10px 15px', borderTop: '1px solid #F2F4F7' };
+    gridTemplateColumns: '34px minmax(0,1fr) 54px 190px 92px 74px 26px',
+    gap: 12, alignItems: 'center', padding: '13px 16px', borderTop: '1px solid #F2F4F7',
+    fontSize: 13.5, lineHeight: 1.45 };
 
   const bars = holders.map((h) => {
     const w = byId[h.w] || {};
@@ -901,12 +989,10 @@ function MarketRow({ m, wallets, books, events, watched, onToggleWatch, onOpen, 
       background: pinned ? '#FCFCFD' : undefined })}
       data-mrow={m.key}
       onClick={(e) => { if (e.target.closest('[data-stop]') || pinned) return; onOpen(m.key); }}>
-      <MarketIcon src={m.icon} size={26} />
-      <span style={{ fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden',
+      <MarketIcon src={m.icon} size={34} />
+      <span style={{ fontSize: 14, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden',
         textOverflow: 'ellipsis' }} title={m.title}>{m.title}</span>
-      {split ? <span style={{ fontSize: 10, fontWeight: 700, color: C.orange,
-        background: C.orange + '12', border: '1px solid ' + C.orange + '30', borderRadius: 4,
-        padding: '2px 0', textAlign: 'center' }}>split</span> : <span />}
+<span />
       <span style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 3 }}>
         {bars}
         <span style={{ position: 'absolute', left: '50%', top: -2, bottom: -2, width: 1,
@@ -1058,13 +1144,13 @@ function MarketsView({ markets, index, wallets, books, events, watch, focus, onT
           <input value={q} onChange={(e) => setQ(e.target.value)}
             placeholder="Search any market these wallets are in, then add it…"
             style={{ width: '100%', border: '1px solid ' + C.border, borderRadius: 8,
-              padding: '9px 12px', font: 'inherit', fontSize: 13, outline: 'none' }} />
+              padding: '10px 13px', font: 'inherit', fontSize: 13.5, outline: 'none' }} />
         </div>
         {hits.map((m) => (
           <div key={m.key} style={{ display: 'flex', alignItems: 'center', gap: 10,
-            padding: '8px 15px', borderTop: '1px solid #F2F4F7' }}>
-            <MarketIcon src={m.icon} size={22} />
-            <span style={{ flex: 1, minWidth: 0, fontSize: 13, whiteSpace: 'nowrap',
+            padding: '10px 16px', borderTop: '1px solid #F2F4F7' }}>
+            <MarketIcon src={m.icon} size={28} />
+            <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, whiteSpace: 'nowrap',
               overflow: 'hidden', textOverflow: 'ellipsis' }}>{m.title}</span>
             <Tiny>{m.holders.length} wallet{m.holders.length === 1 ? '' : 's'}</Tiny>
             <IconBtn title="Add to watchlist" tone={C.blue}
@@ -1121,12 +1207,13 @@ function WalletsView({ wallets, books, events, now }) {
               (touched[x.key] ? touched[x.key].at : 0)) || y.value - x.value);
         const big = b.pos.length ? b.pos[0].pct : 1;
         const ROW = { display: 'grid',
-          gridTemplateColumns: '26px 46px minmax(0,1fr) 78px 92px 86px', gap: 11,
-          alignItems: 'center', padding: '7px 15px', borderTop: '1px solid #F2F4F7', fontSize: 12.5 };
+          gridTemplateColumns: '32px 50px minmax(0,1fr) 84px 96px 92px', gap: 12,
+          alignItems: 'center', padding: '11px 16px', borderTop: '1px solid #F2F4F7',
+          fontSize: 13.5, lineHeight: 1.45 };
         return (
           <Card key={w.id}>
             <CardHead>
-              <Identicon addr={w.addr} colour={w.colour} size={22} />
+              <WalletMark w={w} size={26} />
               <span style={{ fontSize: 13, fontWeight: 700 }}>{w.label}</span>
               <span style={{ display: 'flex', gap: 6, marginLeft: 8 }}>
                 {[['size', 'Size'], ['recent', 'Recently moved']].map((s) => (
@@ -1141,7 +1228,7 @@ function WalletsView({ wallets, books, events, now }) {
               const t = touched[p.key];
               return (
                 <div key={p.key + p.asset} style={ROW}>
-                  <MarketIcon src={p.icon} size={22} />
+                  <MarketIcon src={p.icon} size={30} />
                   <Badge kind={p.outcome === 'YES' ? 'YES' : 'NO'} width={46} />
                   <span title={p.title} style={{ whiteSpace: 'nowrap', overflow: 'hidden',
                     textOverflow: 'ellipsis', color: C.ink2 }}>{p.title}</span>
@@ -1199,7 +1286,8 @@ function AddWallet({ onSave, onClose, taken }) {
       </label>
       <div style={{ display: 'flex', gap: 8, marginTop: 20 }}>
         <Btn kind="primary" disabled={!ok || dup}
-          onClick={() => onSave({ addr: a, label: label.trim() || shortAddr(a), mine })}>
+          onClick={() => onSave({ addr: a, label: label.trim() || shortAddr(a),
+            named: !!label.trim(), mine })}>
           Follow
         </Btn>
         <Btn onClick={onClose}>Cancel</Btn>
@@ -1211,12 +1299,14 @@ function AddWallet({ onSave, onClose, taken }) {
 
 /* ------------------------------------------------------ the connection */
 const RELAY_PRESETS = [
+  { id: 'direct', label: 'Straight to Polymarket', url: '',
+    note: 'What you want. Nothing sits in the middle, nothing to set up, and it is the fastest. Leave it here unless a sync comes back blocked.' },
   { id: 'allorigins', label: 'Public relay (allorigins.win)',
     url: 'https://api.allorigins.win/raw?url=',
-    note: 'Nothing to set up. A stranger\u2019s server sees which wallets you look at \u2014 all public information, and it can never move funds. It can be slow or busy.' },
+    note: 'Only if going straight is blocked. A stranger’s server sees which wallets you look at — all public information, and it can never move funds. Often slow or busy.' },
   { id: 'codetabs', label: 'Public relay (codetabs.com)',
     url: 'https://api.codetabs.com/v1/proxy?quest=',
-    note: 'A second one to fall back on if the first is down. Same trade-off.' },
+    note: 'A second one to fall back on. Same trade-off.' },
 ];
 
 function ConnectionModal({ value, onSave, onClose }) {
@@ -1255,7 +1345,7 @@ function ConnectionModal({ value, onSave, onClose }) {
     } catch (e) {
       setResult({ ok: false, m: t
         ? 'Could not reach that address.'
-        : 'Blocked, as expected \u2014 pick or paste a relay above.' });
+        : 'Blocked \u2014 try one of the relays above.' });
     }
     setBusy(false);
   };
@@ -1263,16 +1353,17 @@ function ConnectionModal({ value, onSave, onClose }) {
   return (
     <Modal title="Connection" onClose={onClose}>
       <Tiny style={{ display: 'block', lineHeight: 1.55 }}>
-        Polymarket only answers browsers on polymarket.com. To read it from here the
-        page needs a relay \u2014 an address that fetches the data for it and passes it back.
+        This page reads Polymarket directly, which is how it should be. A relay \u2014 an
+        address that fetches the data on the page\u2019s behalf \u2014 is only worth
+        setting up if a sync comes back saying the browser blocked it.
       </Tiny>
 
       <div style={{ marginTop: 16, display: 'grid', gap: 8 }}>
         {RELAY_PRESETS.map((r) => (
           <button key={r.id} onClick={() => { setV(r.url); setResult(null); }}
             style={{ textAlign: 'left', cursor: 'pointer', font: 'inherit',
-              border: '1px solid ' + (v === r.url ? C.blue : C.border),
-              background: v === r.url ? C.blue + '0C' : C.card,
+              border: '1px solid ' + (String(v || '').trim() === r.url ? C.blue : C.border),
+              background: String(v || '').trim() === r.url ? C.blue + '0C' : C.card,
               borderRadius: 8, padding: '10px 12px' }}>
             <div style={{ fontSize: 13, fontWeight: 650 }}>{r.label}</div>
             <Tiny style={{ display: 'block', marginTop: 3, lineHeight: 1.5 }}>{r.note}</Tiny>
@@ -1286,8 +1377,7 @@ function ConnectionModal({ value, onSave, onClose }) {
         <input value={v} onChange={(e) => { setV(e.target.value); setResult(null); }}
           placeholder="https://\u2026/?url=" style={inp} />
         <Tiny style={{ display: 'block', marginTop: 6, lineHeight: 1.5 }}>
-          Your own relay goes here too \u2014 paste it ending in <code>?url=</code>.
-          Leave it empty to call Polymarket directly.
+          Empty means straight to Polymarket. Your own relay goes here, ending in <code>?url=</code>.
         </Tiny>
       </div>
 
@@ -1328,10 +1418,13 @@ function App() {
   const [now, setNow] = useState(Date.now());
 
   const wRef = useRef([]); const bRef = useRef({}); const eRef = useRef({}); const watRef = useRef([]);
+  const syRef = useRef({});
   const putWallets = (v) => { wRef.current = v; setWallets(v); Store.set(K_WALLETS, v); };
   const putBooks = (v) => { bRef.current = v; setBooks(v); Store.set(K_BOOKS, v); };
   const putEvents = (v) => { eRef.current = v; setEvents(v); Store.set(K_EVENTS, v); };
   const putWatch = (v) => { watRef.current = v; setWatch(v); Store.set(K_WATCH, v); };
+  /* When each wallet was last read, so the next read can start there. */
+  const putSynced = (v) => { syRef.current = v; Store.set(K_SYNCED, v); };
 
   useEffect(() => {
     (async () => {
@@ -1340,6 +1433,8 @@ function App() {
       const e = await Store.get(K_EVENTS, {});
       const t = await Store.get(K_WATCH, []);
       const p = await Store.get(K_PREFS, null);
+      const sy = await Store.get(K_SYNCED, {});
+      syRef.current = (sy && typeof sy === 'object') ? sy : {};
       const rl = await Store.get(K_RELAY, '');
       setRelay(rl); setRelayV(typeof rl === 'string' ? rl : '');
       wRef.current = Array.isArray(w) ? w : []; setWallets(wRef.current);
@@ -1357,31 +1452,84 @@ function App() {
   useEffect(() => { if (ready) Store.set(K_PREFS, { win, tab, hidden }); }, [ready, win, tab, hidden]);
 
   /* ---- sync */
-  const sync = useCallback(async () => {
+  const sync = useCallback(async (full) => {
     const ws = wRef.current;
     if (!ws.length || syncing) return;
     setSyncing(true);
-    const since = Math.floor(Date.now() / 1000) - 45 * 86400;
+    Progress.stopped = false;
+    /* The window the app will ever show. Everything older is dropped. */
+    const floor = Math.floor(Date.now() / 1000) - 45 * 86400;
+    /* And the point each wallet is read from: the whole window the first
+       time, and only what has happened since the last read after that, with
+       two hours of overlap so nothing can slip through the seam. */
+    const marks = Object.assign({}, syRef.current);
+    const startFor = (w) => {
+      if (full) return floor;
+      const had = num(marks[w.id]);
+      return had > 0 ? Math.max(floor, had - 2 * 3600) : floor;
+    };
     const nb = Object.assign({}, bRef.current), ne = Object.assign({}, eRef.current);
     const failed = [];
-    for (let i = 0; i < ws.length; i++) {
-      const w = ws[i];
-      setStatus({ kind: 'info', text: 'Reading ' + w.label + ' — ' + (i + 1) +
-        ' of ' + ws.length + '…' + (RELAY ? ' (through the relay, so give it a moment)' : '') });
+    const named = {};
+
+    /* Wallets are read at the same time rather than one after another, and
+       each wallet's positions and history are read at the same time as each
+       other, so the whole sync takes about as long as its slowest wallet
+       instead of the sum of all of them. */
+    let done = 0, note = '';
+    const say = () => setStatus({ kind: 'info',
+      text: 'Reading ' + ws.length + ' wallet' + (ws.length === 1 ? '' : 's') +
+        '\u2026 ' + done + ' done' + (note ? ' \u00b7 ' + note : '') });
+    /* Calls overlap now, so the note is whatever was last asked for rather
+       than a single thread of work \u2014 enough to show it is alive, and to
+       show a retry when one happens. */
+    Progress.say = (what) => { note = what; say(); };
+    say();
+
+    await Promise.all(ws.map(async (w) => {
       try {
-        const raw = await fetchPositions(w.addr);
-        nb[w.id] = bookFrom(raw);
+        const from = startFor(w);
+        const [book, trades] = await Promise.all([
+          fetchPositions(w.addr),
+          fetchTrades(w.addr, from).catch(() => []),
+        ]);
+        nb[w.id] = bookFrom(book.pos);
         const held = {};
-        (raw || []).forEach((p) => { held[p.asset] = num(p.size); });
-        const trades = await fetchTrades(w.addr, since).catch(() => []);
-        ne[w.id] = classify(trades, held).filter((t) => t.at >= since)
+        book.pos.forEach((p) => { held[p.asset] = num(p.size); });
+        const fresh = classify(trades, held).filter((t) => t.at >= from)
           .map((t) => Object.assign({ w: w.id }, t));
+        /* A full read replaces the history; a catch-up is folded into it. */
+        ne[w.id] = (full || from <= floor)
+          ? fresh.filter((t) => t.at >= floor)
+          : mergeEvents(eRef.current[w.id] || [], fresh, floor);
+        marks[w.id] = Math.floor(Date.now() / 1000);
+        /* Who it belongs to, from the positions or, failing that, a trade. */
+        const o = book.owner ||
+          (trades.length ? ownerFrom(trades[0]) : null);
+        if (o) named[w.id] = o;
       } catch (err) {
-        failed.push({ label: w.label,
+        if (err && err.stop) failed.push({ label: w.label, why: 'stopped' });
+        else failed.push({ label: w.label,
           why: (err && err.plain) ? err.message : readError(err) });
       }
+      done += 1; say();
+    }));
+
+    /* A name you typed is yours to keep; one we invented gets replaced. */
+    if (Object.keys(named).length) {
+      const next = wRef.current.map((w) => {
+        const o = named[w.id];
+        if (!o) return w;
+        const auto = !w.named || w.label === shortAddr(w.addr);
+        return Object.assign({}, w, {
+          avatar: o.avatar || w.avatar || '',
+          label: (auto && o.name) ? o.name : w.label,
+        });
+      });
+      putWallets(next);
     }
-    putBooks(nb); putEvents(ne); setNow(Date.now());
+
+    putBooks(nb); putEvents(ne); putSynced(marks); setNow(Date.now());
 
     /* Your own markets follow themselves onto the list. */
     const mineIds = ws.filter((w) => w.mine).map((w) => w.id);
@@ -1394,7 +1542,14 @@ function App() {
     });
     if (add.length) putWatch(watRef.current.concat(add));
 
+    Progress.say = null;
+    const wasStopped = Progress.stopped;
+    Progress.stopped = false;
     setSyncing(false);
+    if (wasStopped) {
+      setStatus({ kind: 'info', text: 'Stopped. Whatever was read before you stopped is kept.' });
+      return;
+    }
     const reasons = failed.map((f) => f.why);
     const same = reasons.length && reasons.every((r) => r === reasons[0]);
     setStatus(failed.length
@@ -1404,27 +1559,42 @@ function App() {
               (same ? ' — ' + reasons[0] : '. ' + failed.map((f) => f.label + ': ' + f.why).join('; ')) }
       : { kind: 'ok', text: 'Synced ' + new Date().toLocaleTimeString('en-US',
           { hour: '2-digit', minute: '2-digit' }) + ' · ' + ws.length + ' wallet' +
-          (ws.length === 1 ? '' : 's') + (add.length ? ' · ' + add.length + ' added to the watchlist' : '') });
+          (ws.length === 1 ? '' : 's') + (full ? ' · full re-read' : '') +
+          (add.length ? ' · ' + add.length + ' added to the watchlist' : '') });
   }, [syncing]);
 
   /* ---- derived */
-  const visible = useMemo(() => wallets.filter((w) => !hidden[w.id]), [wallets, hidden]);
+  /* Two different audiences. The feed is for watching other people, so your
+     own wallet is never in it — you know what you did. The markets tab is
+     for comparing, where leaving yourself out would defeat the point, so you
+     are always there and the eye governs everyone else. */
+  const forMarkets = useMemo(() => wallets.filter((w) => w.mine || !hidden[w.id]),
+    [wallets, hidden]);
+  const forFeed = useMemo(() => wallets.filter((w) => !w.mine && !hidden[w.id]),
+    [wallets, hidden]);
   const cutoff = Math.floor(now / 1000) - win * 3600;
   const allEvents = useMemo(() => {
     const out = [];
-    visible.forEach((w) => { (events[w.id] || []).forEach((e) => {
+    forFeed.forEach((w) => { (events[w.id] || []).forEach((e) => {
       if (e.at >= cutoff) out.push(e); }); });
     return out.sort((a, b) => b.at - a.at);
-  }, [visible, events, cutoff]);
+  }, [forFeed, events, cutoff]);
   const feed = useMemo(() => (sel ? allEvents.filter((e) => e.w === sel) : allEvents),
     [allEvents, sel]);
+  /* The comparison counts your own moves even though the feed does not. */
+  const marketEvents = useMemo(() => {
+    const out = [];
+    forMarkets.forEach((w) => { (events[w.id] || []).forEach((e) => {
+      if (e.at >= cutoff) out.push(e); }); });
+    return out.sort((a, b) => b.at - a.at);
+  }, [forMarkets, events, cutoff]);
   const counts = useMemo(() => {
     const m = {};
     wallets.forEach((w) => { m[w.id] = (events[w.id] || []).filter((e) => e.at >= cutoff).length; });
     return m;
   }, [wallets, events, cutoff]);
 
-  /* every market anyone visible holds, or has touched in the window */
+  /* every market anyone in the comparison holds, or touched in the window */
   const index = useMemo(() => {
     const ix = {};
     const put = (key, title, icon) => {
@@ -1434,7 +1604,7 @@ function App() {
       if (title && title.length < ix[key].title.length) ix[key].title = title;
       return ix[key];
     };
-    visible.forEach((w) => {
+    forMarkets.forEach((w) => {
       const b = books[w.id];
       if (b) {
         b.pos.forEach((p) => {
@@ -1447,7 +1617,7 @@ function App() {
     });
     Object.keys(ix).forEach((k) => { ix[k].gone = ix[k].resolved || ix[k].holders.length === 0; });
     return ix;
-  }, [visible, books, events, cutoff]);
+  }, [forMarkets, books, events, cutoff]);
   const markets = useMemo(() => Object.keys(index).map((k) => index[k])
     .sort((a, b) => b.holders.reduce((s, h) => s + h.value, 0) -
       a.holders.reduce((s, h) => s + h.value, 0)), [index]);
@@ -1461,7 +1631,7 @@ function App() {
     const colour = d.mine ? MINE_COLOUR :
       (WCOLOURS.filter((c) => used.indexOf(c) < 0)[0] || WCOLOURS[wRef.current.length % WCOLOURS.length]);
     putWallets(wRef.current.concat([{ id: 'w' + Date.now().toString(36), addr: d.addr,
-      label: d.label, colour, mine: !!d.mine }]));
+      label: d.label, named: !!d.named, avatar: '', colour, mine: !!d.mine }]));
     setAdding(false);
     setStatus({ kind: 'info', text: 'Added ' + d.label + ' — press Sync to read it.' });
   }, []);
@@ -1469,6 +1639,7 @@ function App() {
     putWallets(wRef.current.filter((x) => x.id !== w.id));
     const nb = Object.assign({}, bRef.current); delete nb[w.id]; putBooks(nb);
     const ne = Object.assign({}, eRef.current); delete ne[w.id]; putEvents(ne);
+    const ns = Object.assign({}, syRef.current); delete ns[w.id]; putSynced(ns);
     if (sel === w.id) setSel(null);
   }, [sel]);
 
@@ -1509,11 +1680,18 @@ function App() {
             ))}
           </span>
           <Btn onClick={() => setConn(true)} title="How this page reaches Polymarket">
-            {relay ? 'Connection ✓' : 'Connection'}
+            {relay ? 'Connection \u00b7 relay' : 'Connection'}
           </Btn>
-          <Btn kind="primary" onClick={sync} disabled={syncing || !wallets.length}>
+          {syncing
+            ? <Btn onClick={() => { Progress.stopped = true; }}>Stop</Btn>
+            : null}
+          {/* A click event is truthy, so the handler must not take it as
+              "read everything". */}
+          <Btn kind="primary" onClick={() => sync(false)} disabled={syncing || !wallets.length}>
             {syncing ? 'Syncing…' : 'Sync'}
           </Btn>
+          <IconBtn title="Re-read all history from scratch"
+            onClick={() => { if (!syncing && wallets.length) sync(true); }}>{REDO}</IconBtn>
         </div>
         {status && (
           <div style={{ borderTop: '1px solid ' + C.border,
@@ -1560,10 +1738,10 @@ function App() {
               window.scrollTo({ top: 0, behavior: 'smooth' }); }} />
         ) : tab === 'markets' ? (
           <MarketsView markets={markets} index={index} wallets={wallets} books={books}
-            events={allEvents} watch={watch} focus={focus} now={now}
+            events={marketEvents} watch={watch} focus={focus} now={now}
             onToggleWatch={toggleWatch} onUnfocus={() => setFocus(null)} />
         ) : (
-          <WalletsView wallets={visible} books={books} events={allEvents} now={now} />
+          <WalletsView wallets={forMarkets} books={books} events={marketEvents} now={now} />
         )}
       </div>
 
