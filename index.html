@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v12';
+const APP_VERSION = 'v13';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -605,8 +605,14 @@ function bookFrom(raw) {
    because it was read against today's holdings; anything older than the
    window falls off the end. The same fill can arrive from either side, so
    identity is the transaction plus what it did, not the object. */
+/* One fill's identity: the transaction plus what it did, so the same move
+   read twice is still one move. */
+function eventId(e) {
+  return [e.hash || '', e.asset || '', e.at, e.side, e.shares].join('|');
+}
+
 function mergeEvents(kept, fresh, floor) {
-  const idOf = (e) => [e.hash || '', e.asset || '', e.at, e.side, e.shares].join('|');
+  const idOf = eventId;
   const seen = {};
   const out = [];
   (fresh || []).forEach((e) => {
@@ -891,7 +897,7 @@ function ActivitySummary({ events, wallets, byId, onOpenMarket, now }) {
         const es = markets[k];
         const d = digest(es);
         return d && { key: k, title: es[0].title, icon: es[0].icon,
-          outcome: es[0].outcome, d };
+          outcome: es[0].outcome, fresh: es.some((e) => e.fresh), d };
       }).filter(Boolean).sort((a, b) => b.d.last - a.d.last);
       if (!rows.length) return null;
       const inn = rows.reduce((a, r) => a + r.d.inn, 0);
@@ -907,8 +913,10 @@ function ActivitySummary({ events, wallets, byId, onOpenMarket, now }) {
   }
   const ROW = { display: 'grid',
     gridTemplateColumns: '32px 50px minmax(0,1fr) 108px 86px 64px',
-    gap: 12, alignItems: 'center', padding: '11px 16px 11px 30px',
-    borderTop: '1px solid #F2F4F7', fontSize: 13.5, lineHeight: 1.45 };
+    gap: 12, alignItems: 'center', padding: '11px 16px 11px 27px',
+    borderTop: '1px solid #F2F4F7', fontSize: 13.5, lineHeight: 1.45,
+    borderLeft: '3px solid transparent' };
+  const NEW_ROW = Object.assign({}, ROW, { borderLeft: '3px solid ' + C.blue });
   return (
     <div>
       {blocks.map((b) => (
@@ -928,7 +936,8 @@ function ActivitySummary({ events, wallets, byId, onOpenMarket, now }) {
             </span>
           </div>
           {b.rows.map((r) => (
-            <div key={r.key} style={ROW}>
+            <div key={r.key} data-fresh={r.fresh ? '1' : undefined}
+              style={r.fresh ? NEW_ROW : ROW}>
               <MarketIcon src={r.icon} size={30} />
               <Badge kind={r.outcome === 'YES' ? 'YES' : 'NO'} width={50} />
               <span data-summary-market={r.key} onClick={() => onOpenMarket(r.key)} title={r.title}
@@ -959,10 +968,11 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
         </div></Card>
     );
   }
-  let inn = 0, out = 0, news = 0;
+  let inn = 0, out = 0, news = 0, arrived = 0;
   events.forEach((e) => {
     if (e.kind === 'ADDED' || e.kind === 'NEW') { inn += e.value; if (e.kind === 'NEW') news++; }
     else out += e.value;
+    if (e.fresh) arrived++;
   });
   const days = [];
   events.forEach((e) => {
@@ -972,10 +982,14 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
   });
   /* who did it, then what it was done to: the wallet's own mark sits beside
      the market's picture so a row never has to be read to be placed. */
+  /* A bar down the left edge of everything the last sync brought in. It is
+     a border rather than a shade so a run of new moves reads as one block,
+     and the padding gives the width back so nothing shifts. */
   const ROW = { display: 'grid',
     gridTemplateColumns: '60px 24px 32px 88px 50px minmax(0,1fr) 124px 82px 94px',
     gap: 10, alignItems: 'center', padding: '11px 16px', borderTop: '1px solid #F2F4F7',
-    fontSize: 13.5, lineHeight: 1.45 };
+    fontSize: 13.5, lineHeight: 1.45, borderLeft: '3px solid transparent' };
+  const NEW_ROW = Object.assign({}, ROW, { borderLeft: '3px solid ' + C.blue });
   return (
     <Card>
       <CardHead>
@@ -996,7 +1010,12 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
           <Chip on={sub === 'summary'} onClick={() => setSub('summary')}>Summary</Chip>
         </span>
         <span style={{ marginLeft: 'auto', fontSize: 12, color: C.ink3 }}>
-          {events.length} move{events.length === 1 ? '' : 's'} · {news} new ·{' '}
+          {events.length} move{events.length === 1 ? '' : 's'} ·{' '}
+          {arrived > 0 && (
+            <span style={{ color: C.blue, fontWeight: 600 }}
+              title="Brought in by the last sync">{arrived} since last sync · </span>
+          )}
+          {news} new ·{' '}
           <span style={{ color: C.green }}>+{money(inn)}</span> in ·{' '}
           <span style={{ color: C.orange }}>−{money(out)}</span> out
         </span>
@@ -1019,7 +1038,8 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
             const big = b && b.pos.length ? b.pos[0].pct : 1;
             const up = e.kind === 'ADDED' || e.kind === 'NEW';
             return (
-              <div key={e.at + '-' + e.asset + '-' + i} style={ROW}>
+              <div key={e.at + '-' + e.asset + '-' + i} data-fresh={e.fresh ? '1' : undefined}
+                style={e.fresh ? NEW_ROW : ROW}>
                 <Tiny>{ago(e.at, now)}</Tiny>
                 <WalletMark w={w} size={24} />
                 <MarketIcon src={e.icon} size={32} />
@@ -1590,9 +1610,19 @@ function App() {
         const fresh = classify(trades, held).filter((t) => t.at >= from)
           .map((t) => Object.assign({ w: w.id }, t));
         /* A full read replaces the history; a catch-up is folded into it. */
-        ne[w.id] = (full || from <= floor)
+        const kept = eRef.current[w.id] || [];
+        const list = (full || from <= floor)
           ? fresh.filter((t) => t.at >= floor)
-          : mergeEvents(eRef.current[w.id] || [], fresh, floor);
+          : mergeEvents(kept, fresh, floor);
+        /* What this sync actually brought in, so the feed can mark it. On a
+           wallet's first read nothing is marked \u2014 all of it is new, and a
+           page of stripes says nothing. A full re-read finds the same moves
+           again, so it marks nothing either. */
+        const before = {};
+        kept.forEach((e) => { before[eventId(e)] = 1; });
+        const hadBefore = kept.length > 0;
+        ne[w.id] = list.map((e) => Object.assign({}, e,
+          { fresh: hadBefore && !before[eventId(e)] }));
         marks[w.id] = Math.floor(Date.now() / 1000);
         /* Who it belongs to, from the positions or, failing that, a trade. */
         const o = book.owner ||
