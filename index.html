@@ -224,7 +224,7 @@ const C = {
   blue: '#2E5CFF', green: '#0B7A42', red: '#C62828', amber: '#9A6400',
   orange: '#C2410C', gray: '#9AA1AC', ink: '#0B0D12', ink2: '#3F4552', ink3: '#6B7280',
 };
-const APP_VERSION = 'v13';
+const APP_VERSION = 'v15';
 const APP_BUILT = '8 Nov 2026';
 const MONO = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
@@ -590,6 +590,7 @@ function bookFrom(raw) {
       icon: p.icon || null, slug: p.slug || '', eventSlug: p.eventSlug || '',
       outcome: String(p.outcome || '').toUpperCase(), shares: num(p.size),
       price: num(p.curPrice), value: num(p.currentValue), endDate: p.endDate || null,
+      avg: num(p.avgPrice),
     }));
   const tot = pos.reduce((a, p) => a + p.value, 0);
   pos.forEach((p) => { p.pct = tot > 0 ? p.value / tot * 100 : 0; });
@@ -870,6 +871,60 @@ function WalletStrip({ wallets, books, counts, sel, hidden, onPick, onHide, onRe
 }
 
 /* --------------------------------------------------------- the feed */
+/* Which way a move pushed that wallet's bet on YES. Buying YES and selling
+   NO are the same gesture — both lean towards YES — and the colour should
+   say so, rather than saying "money went out". So: leaning YES is green,
+   leaning NO is red, whichever side of the book it happened on. */
+function driftOf(kind, outcome) {
+  if (!kind) return null;
+  const bought = kind === 'ADDED' || kind === 'NEW';
+  const yes = String(outcome || '').toUpperCase() === 'YES';
+  return bought === yes ? 'yes' : 'no';
+}
+const driftColour = (d) => (d === 'yes' ? C.green : d === 'no' ? C.red : C.ink3);
+
+/* What the row amounts to, in a few words. The one worth reading is the
+   last: your own money sitting in something the others are walking out of. */
+function verdictOf(cells) {
+  const held = cells.filter((c) => c.held);
+  const mine = cells.filter((c) => c.w.mine)[0];
+  const others = cells.filter((c) => !c.w.mine);
+  const othersHeld = others.filter((c) => c.held);
+  if (!held.length) return { text: 'nobody holds this', tone: C.ink3 };
+  const sides = {}; held.forEach((c) => { sides[c.outcome] = 1; });
+  const split = Object.keys(sides).length > 1;
+
+  const leaving = othersHeld.length > 0 &&
+    othersHeld.every((c) => c.drift === null || c.outOfIt);
+  if (mine && mine.held && othersHeld.length && othersHeld.every((c) => c.outOfIt)) {
+    return { text: 'they are leaving, you are not', tone: C.red };
+  }
+  const piling = others.filter((c) => c.drift && !c.outOfIt);
+  if (!split && piling.length >= 2 && piling.every((c) => c.drift === piling[0].drift) &&
+      (!mine || !mine.held)) {
+    return { text: 'crowd forming, you are out', tone: C.blue };
+  }
+  if (split) return { text: 'split', tone: C.orange };
+  if (leaving) return { text: 'quiet', tone: C.ink3 };
+  return { text: 'all ' + held.length + ' agree', tone: C.green };
+}
+
+/* Cents, the way the rest of the app writes them. Under a cent still has to
+   be distinguishable from nothing, so it keeps a decimal. */
+function cents(v) {
+  const c = num(v) * 100;
+  if (!(c > 0)) return null;
+  return (c < 1 ? c.toFixed(1) : Math.round(c)) + '\u00a2';
+}
+
+/* What a run of fills cost on average: weighted by size, not a mean of
+   prices, or one big fill would count the same as one tiny one. */
+function avgFill(events) {
+  let sh = 0, paid = 0;
+  (events || []).forEach((e) => { sh += num(e.shares); paid += num(e.shares) * num(e.price); });
+  return sh > 0 ? paid / sh : 0;
+}
+
 /* The badge next to this already says what happened, so this is only the
    size of it — the full sentence stays on hover. */
 function amountOf(d) {
@@ -897,7 +952,8 @@ function ActivitySummary({ events, wallets, byId, onOpenMarket, now }) {
         const es = markets[k];
         const d = digest(es);
         return d && { key: k, title: es[0].title, icon: es[0].icon,
-          outcome: es[0].outcome, fresh: es.some((e) => e.fresh), d };
+          outcome: es[0].outcome, fresh: es.some((e) => e.fresh),
+          avg: avgFill(es), d };
       }).filter(Boolean).sort((a, b) => b.d.last - a.d.last);
       if (!rows.length) return null;
       const inn = rows.reduce((a, r) => a + r.d.inn, 0);
@@ -912,7 +968,7 @@ function ActivitySummary({ events, wallets, byId, onOpenMarket, now }) {
       Nothing in this window.</div>;
   }
   const ROW = { display: 'grid',
-    gridTemplateColumns: '32px 50px minmax(0,1fr) 108px 86px 64px',
+    gridTemplateColumns: '32px 50px minmax(0,1fr) 108px 86px 58px 64px',
     gap: 12, alignItems: 'center', padding: '11px 16px 11px 27px',
     borderTop: '1px solid #F2F4F7', fontSize: 13.5, lineHeight: 1.45,
     borderLeft: '3px solid transparent' };
@@ -946,6 +1002,8 @@ function ActivitySummary({ events, wallets, byId, onOpenMarket, now }) {
               <Badge kind={r.d.kind} />
               <span style={{ textAlign: 'right', color: C.ink2,
                 fontWeight: 600 }} title={r.d.text}>{amountOf(r.d)}</span>
+              <Tiny style={{ textAlign: 'right' }} title="Average price across these moves">
+                {cents(r.avg) ? '@ ' + cents(r.avg) : '—'}</Tiny>
               <Tiny style={{ textAlign: 'right' }}>{ago(r.d.last, now)}</Tiny>
             </div>
           ))}
@@ -986,8 +1044,8 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
      a border rather than a shade so a run of new moves reads as one block,
      and the padding gives the width back so nothing shifts. */
   const ROW = { display: 'grid',
-    gridTemplateColumns: '60px 24px 32px 88px 50px minmax(0,1fr) 124px 82px 94px',
-    gap: 10, alignItems: 'center', padding: '11px 16px', borderTop: '1px solid #F2F4F7',
+    gridTemplateColumns: '58px 24px 32px 86px 48px minmax(0,1fr) 116px 78px 86px 92px',
+    gap: 9, alignItems: 'center', padding: '11px 16px', borderTop: '1px solid #F2F4F7',
     fontSize: 13.5, lineHeight: 1.45, borderLeft: '3px solid transparent' };
   const NEW_ROW = Object.assign({}, ROW, { borderLeft: '3px solid ' + C.blue });
   return (
@@ -1057,6 +1115,14 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
                 </Tiny>
                 <span style={{ textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap',
                   color: up ? C.green : C.orange }}>{signed(e.kind, e.value)}</span>
+                {/* The move is one thing; the position it left behind is
+                    another, and it is the one that says how much they mean
+                    it. An exit leaves nothing, so it says so. */}
+                <span style={{ textAlign: 'right', whiteSpace: 'nowrap', color: C.ink2 }}
+                  title={held ? 'Holds ' + Math.round(held.shares).toLocaleString() +
+                    ' shares, in at ' + (cents(held.avg) || '—') : 'Holds nothing here now'}>
+                  {held ? money(held.value) : <Tiny>out</Tiny>}
+                </span>
                 <BookShare pct={held ? held.pct : null} colour={w.colour} biggest={big} />
               </div>
             );
@@ -1064,6 +1130,107 @@ function ActivityView({ events, wallets, books, sel, onClearSel, onOpenMarket, n
         </div>
       ))}
     </Card>
+  );
+}
+
+/* ------------------------------------------------- the comparison */
+
+/* One market, every wallet side by side. The bar stands up for YES and
+   hangs down for NO, so agreement is a row of bars pointing the same way
+   and a disagreement is visible without reading a word. Height is share of
+   that wallet's own book, scaled against the biggest holder here, so a
+   $300k wallet and a $900 one can be compared at all. */
+function cellsFor(m, wallets, books, events, cutoff) {
+  return wallets.map((w) => {
+    const bk = books[w.id];
+    const pos = bk ? bk.pos.filter((p) => p.key === m.key)[0] : null;
+    const es = (events || []).filter((e) => e.w === w.id && e.key === m.key && e.at >= cutoff);
+    const d = es.length ? digest(es) : null;
+    const outcome = pos ? pos.outcome : (es.length ? es[0].outcome : '');
+    return {
+      w, held: pos || null, outcome,
+      pct: pos ? pos.pct : 0, value: pos ? pos.value : 0,
+      avg: pos ? pos.avg : (es.length ? avgFill(es) : 0),
+      moves: es.length, d,
+      moved: d ? (d.kind === 'EXITED' ? -d.out : d.net) : 0,
+      movedAvg: es.length ? avgFill(es) : 0,
+      outOfIt: !!d && (d.kind === 'EXITED' || d.kind === 'REDUCED'),
+      drift: d ? driftOf(d.kind, outcome) : null,
+      fresh: es.some((e) => e.fresh),
+    };
+  });
+}
+
+function CompareBars({ cells, height = 84 }) {
+  const top = Math.max.apply(null, cells.map((c) => c.pct).concat([0.0001]));
+  const half = height / 2;
+  return cells.map((c) => {
+    const yes = String(c.outcome).toUpperCase() === 'YES';
+    const h = c.held ? Math.max(7, Math.sqrt(c.pct / top) * (half - 6)) : 0;
+    return (
+      <div key={c.w.id} data-cell={c.w.id}
+        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5 }}>
+        <div style={{ position: 'relative', width: '100%', height, flexShrink: 0 }}>
+          <div style={{ position: 'absolute', left: 0, right: 0, top: half, height: 1,
+            background: C.border }} />
+          {c.held ? (
+            <div title={c.w.label + ' — ' + c.outcome + ' · ' + money(c.value) +
+              ' · ' + c.pct.toFixed(1) + '% of their book'}
+              style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)',
+                width: 16, borderRadius: 3, background: c.w.colour,
+                height: h, top: yes ? half - h : half }} />
+          ) : (
+            <div style={{ position: 'absolute', left: '50%', top: half - 5,
+              transform: 'translateX(-50%)', fontSize: 11, color: C.ink3 }}>—</div>
+          )}
+        </div>
+        <span style={{ fontSize: 12.5, fontWeight: 700,
+          color: c.held ? C.ink : C.ink3 }}>{c.held ? money(c.value) : 'out'}</span>
+        <Tiny title="Average entry price">{c.held && cents(c.avg) ? '@ ' + cents(c.avg) : ' '}</Tiny>
+        {c.d ? (
+          <span style={{ fontSize: 12.5, fontWeight: 700, color: driftColour(c.drift) }}
+            title={c.d.text + ' · ' + c.moves + ' move' + (c.moves === 1 ? '' : 's') +
+              (cents(c.movedAvg) ? ' at ' + cents(c.movedAvg) + ' on average' : '')}>
+            {(c.drift === 'yes' ? '\u25B2 ' : '\u25BC ') + money(Math.abs(c.moved))}
+          </span>
+        ) : <Tiny>no moves</Tiny>}
+        {c.d && cents(c.movedAvg) ? <Tiny>@ {cents(c.movedAvg)}</Tiny> : <Tiny> </Tiny>}
+      </div>
+    );
+  });
+}
+
+/* The panel that sits under a market, wherever the market is shown. */
+function MarketCompare({ m, wallets, books, events, cutoff, cols, names }) {
+  const cells = useMemo(() => cellsFor(m, wallets, books, events, cutoff),
+    [m, wallets, books, events, cutoff]);
+  return (
+    <div style={{ padding: '14px 16px 16px', background: '#FCFCFD' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: cols, gap: 10, alignItems: 'end' }}>
+        <div style={{ fontSize: 11, letterSpacing: 0.5, textTransform: 'uppercase',
+          color: C.ink3, fontWeight: 700, paddingBottom: 30 }}>
+          up = yes · down = no
+        </div>
+        <CompareBars cells={cells} />
+        <span />
+      </div>
+      {/* Under the Compare table the wallet names are already in the header
+          above; a market card has no header, so it gets them here. */}
+      {names !== false && (
+      <div style={{ display: 'grid', gridTemplateColumns: cols, gap: 10, marginTop: 10 }}>
+        <span />
+        {cells.map((c) => (
+          <div key={c.w.id} style={{ textAlign: 'center', display: 'flex',
+            alignItems: 'center', justifyContent: 'center', gap: 6, minWidth: 0 }}>
+            <WalletMark w={c.w} size={18} />
+            <Tiny style={{ whiteSpace: 'nowrap', overflow: 'hidden',
+              textOverflow: 'ellipsis' }}>{c.w.label}</Tiny>
+          </div>
+        ))}
+        <span />
+      </div>
+      )}
+    </div>
   );
 }
 
@@ -1123,49 +1290,31 @@ function MarketRow({ m, wallets, books, events, watched, onToggleWatch, onOpen, 
   );
   if (!open) return <div>{head}</div>;
 
-  const DROW = { display: 'grid', gridTemplateColumns: '132px 46px 78px 92px minmax(0,1fr)',
+  const DROW = { display: 'grid',
+    gridTemplateColumns: '132px 46px 78px 58px 92px minmax(0,1fr)',
     gap: 12, alignItems: 'center', padding: '5px 0', fontSize: 12.5 };
   const tab = sub || 'summary';
+  /* Summary is now the side-by-side comparison, using the same column
+     widths as the Compare tab so the two read identically. */
+  const cols = 'minmax(0,1fr) repeat(' + Math.max(1, wallets.length) + ', 96px) 186px';
   const body = tab === 'summary'
-    ? holders.map((h) => {
-      const w = byId[h.w] || {};
-      const g = digest(mine.filter((e) => e.w === h.w));
-      return (
-        <div key={h.w} style={DROW}>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 600 }}>
-            <Dot colour={w.colour} />{w.label}
-          </span>
-          <Badge kind={h.outcome === 'YES' ? 'YES' : 'NO'} width={46} />
-          <span style={{ textAlign: 'right', fontWeight: 600 }}>{money(h.value)}</span>
-          <BookShare pct={h.pct} colour={w.colour} biggest={(books[h.w] &&
-            books[h.w].pos.length) ? books[h.w].pos[0].pct : 1} />
-          <span style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-            {g ? (
-              <React.Fragment>
-                <span style={{ width: 84, flexShrink: 0 }}><Badge kind={g.kind} /></span>
-                <Tiny style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {g.text} · {g.n} move{g.n === 1 ? '' : 's'} · last {ago(g.last, now)}
-                </Tiny>
-              </React.Fragment>
-            ) : <Tiny>no moves in this window</Tiny>}
-          </span>
-        </div>
-      );
-    })
+    ? <MarketCompare m={m} wallets={wallets} books={books} events={events}
+        cutoff={0} cols={cols} />
     : (mine.length ? mine.map((e, i) => {
       const w = byId[e.w] || {};
-      const up = e.kind === 'ADDED' || e.kind === 'NEW';
+      const d = driftOf(e.kind, e.outcome);
       return (
         <div key={i} style={DROW}>
           <span style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 600 }}>
             <Dot colour={w.colour} />{w.label}
           </span>
           <span style={{ width: 84 }}><Badge kind={e.kind} /></span>
-          <span style={{ textAlign: 'right', fontWeight: 600, color: up ? C.green : C.orange }}>
+          <span style={{ textAlign: 'right', fontWeight: 600, color: driftColour(d) }}>
             {signed(e.kind, e.value)}
           </span>
+          <Tiny style={{ textAlign: 'right' }}>@ {cents(e.price) || '—'}</Tiny>
           <Tiny style={{ textAlign: 'right' }}>
-            {Math.round(e.shares).toLocaleString()} sh @ {Math.round(e.price * 100)}¢
+            {Math.round(e.shares).toLocaleString()} sh
           </Tiny>
           <Tiny>{ago(e.at, now)}</Tiny>
         </div>
@@ -1188,6 +1337,97 @@ function MarketRow({ m, wallets, books, events, watched, onToggleWatch, onOpen, 
 }
 
 /* ------------------------------------------------- markets / watchlist */
+/* --------------------------------------------------- the compare tab */
+function CompareView({ markets, wallets, books, events, cutoff, now, onOpenMarket }) {
+  const [open, setOpen] = useState(null);
+  const cols = 'minmax(0,1fr) repeat(' + Math.max(1, wallets.length) + ', 96px) 186px';
+
+  const rows = useMemo(() => markets.map((m) => {
+    const cells = cellsFor(m, wallets, books, events, cutoff);
+    return { m, cells, verdict: verdictOf(cells),
+      total: cells.reduce((a, c) => a + c.value, 0),
+      moves: cells.reduce((a, c) => a + c.moves, 0),
+      fresh: cells.some((c) => c.fresh) };
+  }).sort((a, b) => b.total - a.total), [markets, wallets, books, events, cutoff]);
+
+  if (!wallets.length) {
+    return <Card><div style={{ padding: 26, textAlign: 'center', color: C.ink3, fontSize: 13 }}>
+      Follow some wallets first.</div></Card>;
+  }
+  if (!rows.length) {
+    return <Card><div style={{ padding: 26, textAlign: 'center', color: C.ink3, fontSize: 13 }}>
+      Nothing on the watchlist yet. Add markets on the Markets tab.</div></Card>;
+  }
+
+  const HEAD = { display: 'grid', gridTemplateColumns: cols, gap: 10, alignItems: 'center',
+    padding: '10px 16px', borderBottom: '1px solid ' + C.border, fontSize: 11,
+    letterSpacing: 0.5, textTransform: 'uppercase', color: C.ink3, fontWeight: 700 };
+  const ROW = { display: 'grid', gridTemplateColumns: cols, gap: 10, alignItems: 'center',
+    padding: '11px 16px', borderTop: '1px solid #F2F4F7', fontSize: 13.5,
+    cursor: 'pointer', borderLeft: '3px solid transparent' };
+
+  return (
+    <Card>
+      <CardHead>
+        <span style={{ fontSize: 13, fontWeight: 700 }}>Compare</span>
+        <Tiny>every watched market · tap a row to see the sizes</Tiny>
+        <span style={{ marginLeft: 'auto', fontSize: 12, color: C.ink3 }}>
+          {rows.length} market{rows.length === 1 ? '' : 's'}
+        </span>
+      </CardHead>
+      <div style={{ overflowX: 'auto' }}>
+        <div style={{ minWidth: 300 + wallets.length * 106 + 168 }}>
+          <div style={HEAD}>
+            <span>Market</span>
+            {wallets.map((w) => (
+              <span key={w.id} style={{ display: 'flex', alignItems: 'center', gap: 6,
+                justifyContent: 'center', minWidth: 0 }}>
+                <WalletMark w={w} size={18} />
+                <span style={{ whiteSpace: 'nowrap', overflow: 'hidden',
+                  textOverflow: 'ellipsis' }}>{w.label}</span>
+              </span>
+            ))}
+            <span style={{ textAlign: 'right' }}>Verdict</span>
+          </div>
+          {rows.map((r) => (
+            <div key={r.m.key} data-compare={r.m.key}>
+              <div style={Object.assign({}, ROW, r.fresh
+                ? { borderLeft: '3px solid ' + C.blue } : null)}
+                onClick={() => setOpen(open === r.m.key ? null : r.m.key)}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                  <MarketIcon src={r.m.icon} size={28} />
+                  <span style={{ whiteSpace: 'nowrap', overflow: 'hidden',
+                    textOverflow: 'ellipsis', fontWeight: 600 }} title={r.m.title}>{r.m.title}</span>
+                </span>
+                {r.cells.map((c) => (
+                  <span key={c.w.id} data-stance={c.w.id}
+                    style={{ display: 'flex', flexDirection: 'column', alignItems: 'center',
+                      gap: 2 }}>
+                    {c.held ? (
+                      <Badge kind={c.outcome === 'YES' ? 'YES' : 'NO'} width={54} />
+                    ) : <Tiny>—</Tiny>}
+                    {c.held && (
+                      <Tiny style={{ color: driftColour(c.drift) }}>
+                        {c.pct.toFixed(1)}%{c.drift ? (c.drift === 'yes' ? ' ▲' : ' ▼') : ''}
+                      </Tiny>
+                    )}
+                  </span>
+                ))}
+                <span style={{ textAlign: 'right', fontWeight: 700, fontSize: 12.5,
+                  color: r.verdict.tone }}>{r.verdict.text}</span>
+              </div>
+              {open === r.m.key && (
+                <MarketCompare m={r.m} wallets={wallets} books={books} events={events}
+                  cutoff={cutoff} cols={cols} names={false} />
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function MarketsView({ markets, index, wallets, books, events, watch, focus, onToggleWatch,
   onUnfocus, sorts, now }) {
   const [q, setQ] = useState('');
@@ -1730,7 +1970,8 @@ function App() {
       if (b) {
         b.pos.forEach((p) => {
           const m = put(p.key, p.title, p.icon);
-          if (m) m.holders.push({ w: w.id, outcome: p.outcome, value: p.value, pct: p.pct });
+          if (m) m.holders.push({ w: w.id, outcome: p.outcome, value: p.value,
+            pct: p.pct, avg: p.avg, shares: p.shares });
         });
         (b.resolved || []).forEach((k) => { if (ix[k]) ix[k].resolved = true; });
       }
@@ -1767,7 +2008,8 @@ function App() {
   if (!ready) return <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center',
     color: C.ink3, fontFamily: MONO, fontSize: 13 }}>Loading…</div>;
 
-  const TABS = [['activity', 'Activity'], ['markets', 'Markets'], ['wallets', 'Wallets']];
+  const TABS = [['activity', 'Activity'], ['markets', 'Markets'],
+    ['compare', 'Compare'], ['wallets', 'Wallets']];
   return (
     <div style={{ minHeight: '100vh' }}>
       <div style={{ position: 'sticky', top: 0, zIndex: 50, background: 'rgba(255,255,255,0.93)',
@@ -1861,6 +2103,11 @@ function App() {
           <MarketsView markets={markets} index={index} wallets={wallets} books={books}
             events={marketEvents} watch={watch} focus={focus} now={now}
             onToggleWatch={toggleWatch} onUnfocus={() => setFocus(null)} />
+        ) : tab === 'compare' ? (
+          <CompareView markets={markets.filter((m) => watch.indexOf(m.key) >= 0)}
+            wallets={forMarkets} books={books} events={marketEvents}
+            cutoff={cutoff} now={now}
+            onOpenMarket={(k) => { setFocus(k); setTab('markets'); }} />
         ) : (
           <WalletsView wallets={forMarkets} books={books} events={marketEvents} now={now} />
         )}
